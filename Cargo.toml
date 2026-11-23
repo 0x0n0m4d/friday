@@ -1,0 +1,41 @@
+[package]
+name = "sexta-feira"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.100"
+description = "Cliente ACP com TUI e push-to-talk (Whisper + Piper) para o agente Sexta-feira no ZeroClaw"
+license = "MIT"
+
+[lib]
+name = "sexta_feira"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sexta-feira"
+path = "src/main.rs"
+
+[[bin]]
+name = "sexta-mock-agente"
+path = "src/bin/mock_agent.rs"
+
+[dependencies]
+clap = { version = "4", default-features = false, features = [
+    "std",
+    "help",
+    "usage",
+    "error-context",
+    "derive",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.28", default-features = false, features = ["events", "bracketed-paste"] }
+libc = "0.2"
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = "symbols"

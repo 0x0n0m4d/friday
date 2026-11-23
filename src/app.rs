@@ -1,0 +1,1217 @@
+//! Núcleo do aplicativo: junta teclado, ACP, push-to-talk, voz e tempos em
+//! uma única máquina de estados dirigida por eventos (consumida pela TUI).
+
+use std::sync::atomic::AtomicBool;
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
+
+use crate::acp::client::AcpClient;
+use crate::acp::types::{ErrorOutcome, Inbound, RpcError, SessionUpdate};
+use crate::config::Config;
+use crate::logger::Logger;
+use crate::ptt::{KeySource, KeySourceEvent};
+use crate::recorder::{self, ActiveRecording, RecorderEvent};
+use crate::sanitize;
+use crate::state::StateDir;
+use crate::stt;
+use crate::stt::WhisperConfig;
+use crate::tts::{prepare_for_speech, Speaker, SpeakerConfig, TtsEvent};
+use crate::tui::ParsedKey;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Author {
+    User,
+    Agent,
+    Info,
+    /// Diagnóstico de modo verboso (`--verbose`): caminhos silenciosos e
+    /// erros de praxe registrados no journal e, só aqui, mostrados na tela.
+    Diag,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatItem {
+    pub author: Author,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    Idle,
+    Listening,
+    Transcribing,
+    Waiting,
+    Speaking,
+    Disconnected,
+    Approval,
+    Error(String),
+}
+
+#[derive(Debug)]
+pub enum AppEvent {
+    Key(ParsedKey),
+    Acp(Inbound),
+    KeySource(KeySourceEvent),
+    RecordDone(Result<recorder::Recording, recorder::RecorderError>),
+    Transcribed(Result<String, String>),
+    TtsStarted,
+    TtsFinished(Result<(), crate::tts::TtsError>),
+    TtsInterrupted,
+    Tick,
+}
+
+pub struct PermissionModal {
+    pub id: Value,
+    pub question: String,
+    pub options: Vec<(String, String)>,
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitPhase {
+    Initializing,
+    Resuming,
+    CreatingSession,
+}
+
+pub struct App {
+    pub cfg: Config,
+    pub agent_alias: String,
+    pub state: Option<StateDir>,
+    pub log: Arc<Logger>,
+    pub events_tx: mpsc::Sender<AppEvent>,
+
+    pub chat: Vec<ChatItem>,
+    pub input: String,
+    pub input_frozen_draft: Option<String>,
+    pub status: Status,
+    pub scroll_offset: usize,
+    pub follow_tail: bool,
+
+    pub acp: Option<AcpClient>,
+    pub session_id: Option<String>,
+    pub init_phase: Option<InitPhase>,
+    pub session_phase: Option<InitPhase>,
+    pub pending_prompt: Option<u64>,
+    pub queued_voice: Option<String>,
+    pub pending_permission: Option<PermissionModal>,
+
+    pub recording: Option<ActiveRecording>,
+    pub press_at: Option<Instant>,
+
+    pub speaker: Option<Speaker>,
+    pub speech_buffer: String,
+
+    pub reconnect_attempt: u32,
+    pub reconnect_at: Option<Instant>,
+    pub retry_text: Option<String>,
+    /// Verboso (`--verbose`): diags de praxe aparecem na tela; journal os
+    /// registra sempre, com ou sem a opção.
+    pub verbose: bool,
+    /// Quando a fase atual do handshake (initialize/load/new) começou:
+    /// alimenta o aviso de "sem resposta" no modo verboso.
+    pub phase_started_at: Option<Instant>,
+    pub quit: bool,
+}
+
+impl App {
+    pub fn new(
+        cfg: Config,
+        agent_alias: String,
+        state: Option<StateDir>,
+        log: Arc<Logger>,
+        events_tx: mpsc::Sender<AppEvent>,
+    ) -> App {
+        App {
+            cfg,
+            agent_alias,
+            state,
+            log,
+            events_tx,
+            chat: Vec::new(),
+            input: String::new(),
+            input_frozen_draft: None,
+            status: Status::Idle,
+            scroll_offset: 0,
+            follow_tail: true,
+            acp: None,
+            session_id: None,
+            init_phase: None,
+            session_phase: None,
+            pending_prompt: None,
+            queued_voice: None,
+            pending_permission: None,
+            recording: None,
+            press_at: None,
+            speaker: None,
+            speech_buffer: String::new(),
+            reconnect_attempt: 0,
+            reconnect_at: None,
+            retry_text: None,
+            verbose: false,
+            phase_started_at: None,
+            quit: false,
+        }
+    }
+
+    /// Liga/desliga o modo verboso antes de `start()`.
+    pub fn set_verbose(&mut self, verbose: bool) {
+        self.verbose = verbose;
+    }
+
+    /// Registra um achado de praxe: journal sempre, tela só em verboso.
+    pub fn diag(&mut self, text: String) {
+        self.log.log_event("diag", &[("texto", json!(text))]);
+        if self.verbose {
+            self.chat.push(ChatItem {
+                author: Author::Diag,
+                text,
+            });
+            self.trim_chat();
+            self.follow_tail = true;
+        }
+    }
+
+    // ---------- boot ----------
+
+    pub fn start(&mut self) {
+        self.info(format!(
+            "Conectando ao daemon ZeroClaw (agente \u{201c}{}\u{201d})…",
+            self.agent_alias
+        ));
+        if self.verbose {
+            let token = match &self.cfg.acp.token_env {
+                Some(name) => format!("token via env {name}"),
+                None => "sem token configurado".to_string(),
+            };
+            self.diag(format!(
+                "config efetiva: acp.url={}, {token}",
+                self.cfg.acp.url.as_deref().unwrap_or("(não configurado)")
+            ));
+            self.diag("modo verboso ativo: erros de praxe aparecem como [diag]".into());
+        }
+        self.spawn_speaker();
+        self.connect();
+        self.spawn_key_source();
+    }
+
+    fn spawn_speaker(&mut self) {
+        if !self.cfg.tts_enabled() {
+            self.diag("voz (tts) desativada na configuração".into());
+            return;
+        }
+        let (Some(piper_cmd), Some(player_cmd)) = (
+            self.cfg.piper.command.clone(),
+            self.cfg.player.command.clone(),
+        ) else {
+            self.diag(
+                "voz habilitada, mas [piper].command e [player].command precisam existir; voz desativada"
+                    .into(),
+            );
+            return;
+        };
+        let tmp_dir = self
+            .state
+            .as_ref()
+            .and_then(|s| s.tmp_dir().ok())
+            .unwrap_or_else(std::env::temp_dir);
+        let cfg = SpeakerConfig {
+            piper_command: piper_cmd,
+            piper_output: self.cfg.piper.output.clone(),
+            player_command: player_cmd,
+            timeout_secs: self.cfg.piper.timeout_secs,
+            max_wav_bytes: self.cfg.piper.max_wav_bytes,
+            tmp_dir,
+        };
+        let (tts_tx, tts_rx) = mpsc::channel::<TtsEvent>();
+        let events_tx = self.events_tx.clone();
+        let tts_bridge = std::thread::Builder::new()
+            .name("tts-bridge".into())
+            .spawn(move || {
+                while let Ok(ev) = tts_rx.recv() {
+                    let forward = match ev {
+                        TtsEvent::Started => AppEvent::TtsStarted,
+                        TtsEvent::Finished(r) => {
+                            AppEvent::TtsFinished(r.map_err(|e| crate::tts::TtsError(e.0)))
+                        }
+                        TtsEvent::Interrupted => AppEvent::TtsInterrupted,
+                    };
+                    if events_tx.send(forward).is_err() {
+                        break;
+                    }
+                }
+            });
+        if let Err(e) = tts_bridge {
+            self.diag(format!("fio tts-bridge não iniciou: {e}"));
+        }
+        self.speaker = Some(Speaker::new(cfg, tts_tx));
+    }
+
+    fn spawn_key_source(&mut self) {
+        if self.cfg.push_to_talk.mode != "hold" {
+            self.diag(format!(
+                "[ptt] modo '{}' não usa evdev; a tecla vem do teclado da TUI",
+                self.cfg.push_to_talk.mode
+            ));
+            return;
+        }
+        let (Some(device), Some(code)) = (self.cfg.ptt_device(), self.cfg.ptt_code()) else {
+            self.diag(
+                "[ptt] sem [push_to_talk].device/code no TOML: leitura da tecla desativada".into(),
+            );
+            return;
+        };
+        let source = crate::ptt::EvdevKeySource {
+            device: device.clone(),
+            code,
+            max_record_secs: self.cfg.push_to_talk.max_record_secs,
+        };
+        let app_tx = self.events_tx.clone();
+        let (ktx, krx) = mpsc::channel::<KeySourceEvent>();
+        let evdev_thread = std::thread::Builder::new()
+            .name("ptt-evdev".into())
+            .spawn(move || {
+                let mut src = source;
+                let stop = Arc::new(AtomicBool::new(false));
+                src.run(ktx, stop);
+            });
+        if let Err(e) = evdev_thread {
+            self.diag(format!("[ptt] fio do evdev não iniciou: {e}"));
+        }
+        let bridge = std::thread::Builder::new()
+            .name("ptt-bridge".into())
+            .spawn(move || {
+                while let Ok(ev) = krx.recv() {
+                    if app_tx.send(AppEvent::KeySource(ev)).is_err() {
+                        break;
+                    }
+                }
+            });
+        if let Err(e) = bridge {
+            self.diag(format!("[ptt] fio da ponte não iniciou: {e}"));
+        }
+        self.diag(format!("[ptt] observando {device} tecla {code}"));
+        self.log.log_event("ptt", &[("fonte", json!("evdev"))]);
+    }
+
+    fn connect(&mut self) {
+        let Some(url) = self.cfg.acp.url.clone() else {
+            self.diag("sem [acp].url no TOML: nada para conectar".into());
+            return;
+        };
+        let token = self
+            .cfg
+            .acp
+            .token_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| t.trim().to_string());
+        if token.is_none() {
+            match &self.cfg.acp.token_env {
+                Some(name) => self.diag(format!(
+                    "[acp] variável {name} vazia ou ausente: conectando sem Authorization"
+                )),
+                None => self
+                    .diag("[acp] token_env não configurado: conectando sem Authorization".into()),
+            }
+        }
+        match AcpClient::connect(&url, token.as_deref(), self.cfg.acp.handshake_timeout_secs) {
+            Ok(mut client) => {
+                self.log.log_event("conectou", &[]);
+                self.reconnect_attempt = 0;
+                self.reconnect_at = None;
+                match client.send_request("initialize", json!({})) {
+                    Ok(_) => {
+                        self.init_phase = Some(InitPhase::Initializing);
+                        self.phase_started_at = Some(Instant::now());
+                        self.diag("[acp] WebSocket aberto; initialize enviado".into());
+                    }
+                    Err(e) => {
+                        client.terminate();
+                        self.connection_lost(&e.to_string());
+                        return;
+                    }
+                }
+                self.acp = Some(client);
+            }
+            Err(e) => self.connection_lost(&e.to_string()),
+        }
+    }
+
+    /// Aplica o estado pós-desconexão, com pagamento exponencial limitado.
+    pub fn connection_lost(&mut self, reason: &str) {
+        self.log.log_error("erro_conexao", reason);
+        if let Some(acp) = self.acp.as_mut() {
+            acp.terminate();
+        }
+        self.acp = None;
+        self.status = Status::Disconnected;
+        self.session_id = None;
+        self.pending_prompt = None;
+        self.init_phase = None;
+        self.session_phase = None;
+        self.phase_started_at = None;
+        self.speech_buffer.clear();
+        let base = self.cfg.limits.reconnect_backoff_min_ms;
+        let max = self.cfg.limits.reconnect_backoff_max_ms;
+        let shift = self.reconnect_attempt.min(6);
+        let backoff = base.saturating_mul(1u64 << shift).min(max);
+        self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
+        self.reconnect_at = Some(Instant::now() + Duration::from_millis(backoff));
+        self.info(format!("Conexão perdida: {reason}"));
+    }
+
+    pub fn info(&mut self, text: String) {
+        self.chat.push(ChatItem {
+            author: Author::Info,
+            text,
+        });
+        self.trim_chat();
+        self.follow_tail = true;
+    }
+
+    fn trim_chat(&mut self) {
+        let max = self.cfg.limits.max_chat_items;
+        if self.chat.len() > max {
+            let drop_count = self.chat.len() - max;
+            self.chat.drain(..drop_count);
+        }
+    }
+
+    /// Encerra tudo em ordem (chamado no fim do programa).
+    pub fn teardown(&mut self) {
+        if let Some(rec) = self.recording.as_mut() {
+            rec.stop();
+        }
+        if let Some(sp) = &self.speaker {
+            sp.shutdown();
+        }
+        if let Some(acp) = self.acp.as_mut() {
+            acp.terminate();
+        }
+    }
+
+    // ---------- envio ----------
+
+    /// Envia um prompt como texto sanitizado. Supõe turno ocioso.
+    pub fn send_prompt(&mut self, text: &str, from_voice: bool) -> bool {
+        let sanitized = sanitize::cap_chars(
+            &sanitize::strip_escapes_and_control(text),
+            self.cfg.acp.prompt_max_chars,
+        );
+        if sanitized.trim().is_empty() {
+            self.status = Status::Idle;
+            return false;
+        }
+        // Contorno para modelos que respondem com bash em markdown em vez de
+        // chamar ferramentas: o lembrete ([agent].tool_reminder) vira a
+        // primeira linha do payload, mas não aparece no chat nem no reenvio
+        // (que guarda o texto do usuário e passa por aqui de novo).
+        let payload = match self.cfg.agent.reminder_line() {
+            Some(reminder) => format!("{reminder}\n\n{sanitized}"),
+            None => sanitized.clone(),
+        };
+        if payload != sanitized {
+            self.diag(
+                "[agent] lembrete de tool call anexado ao prompt ([agent].tool_reminder)"
+                    .into(),
+            );
+        }
+        let Some(session_id) = self.session_id.clone() else {
+            self.retry_text = Some(sanitized);
+            self.diag(
+                "mensagem guardada para reenvio: ainda não há sessão (handshake incompleto?)"
+                    .into(),
+            );
+            return false;
+        };
+        self.status = Status::Waiting;
+        self.chat.push(ChatItem {
+            author: Author::User,
+            text: if from_voice {
+                format!("{sanitized}  (por voz)")
+            } else {
+                sanitized.clone()
+            },
+        });
+        self.trim_chat();
+        self.follow_tail = true;
+        let Some(acp) = self.acp.as_mut() else {
+            self.retry_text = Some(sanitized);
+            self.diag("mensagem guardada para reenvio: conexão inativa no momento".into());
+            return false;
+        };
+        match acp.send_request(
+            "session/prompt",
+            json!({ "sessionId": session_id, "prompt": payload }),
+        ) {
+            Ok(id) => {
+                self.pending_prompt = Some(id);
+                true
+            }
+            Err(e) => {
+                self.connection_lost(&e.to_string());
+                false
+            }
+        }
+    }
+
+    fn restore_draft(&mut self) {
+        if let Some(draft) = self.input_frozen_draft.take() {
+            self.input = draft;
+        }
+    }
+
+    // ---------- permissções ----------
+
+    fn open_permission_modal(&mut self, id: Value, params: &Value) {
+        let question = params
+            .get("toolCall")
+            .and_then(|t| t.get("title"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("o agente quer usar uma ferramenta")
+            .to_string();
+        let mut options = Vec::new();
+        if let Some(list) = params.get("options").and_then(|o| o.as_array()) {
+            for opt in list {
+                let oid = opt
+                    .get("optionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = opt
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&oid)
+                    .to_string();
+                options.push((oid, name));
+            }
+        }
+        if options.is_empty() {
+            options.push(("permitir".into(), "Permitir".into()));
+        }
+        self.pending_permission = Some(PermissionModal {
+            id,
+            question,
+            options,
+            selected: 0,
+        });
+        self.status = Status::Approval;
+        self.log
+            .log_event("permissao", &[("fase", json!("pedida"))]);
+    }
+
+    pub fn answer_permission(&mut self, cancel: bool) {
+        let Some(modal) = self.pending_permission.take() else {
+            self.diag("resposta de aprovação sem modal aberto; nada feito".into());
+            return;
+        };
+        self.status = Status::Idle;
+        let Some(acp) = self.acp.as_ref() else {
+            self.diag("resposta da permissão não enviada: conexão inativa".into());
+            return;
+        };
+        let result = if cancel {
+            json!({ "outcome": { "outcome": "cancelled" } })
+        } else {
+            let option_id = &modal.options[modal.selected].0;
+            json!({ "outcome": { "outcome": "selected", "optionId": option_id } })
+        };
+        self.log
+            .log_event("permissao", &[("fase", json!("respondida"))]);
+        if let Err(e) = acp.reply_request(&modal.id, result) {
+            self.connection_lost(&e.to_string());
+        }
+    }
+
+    // ---------- voz ----------
+
+    /// Tecla de voz pressionada: corta fala, congela digitação, grava.
+    pub fn on_key_press(&mut self) {
+        if let Some(sp) = &self.speaker {
+            sp.interrupt();
+        }
+        self.speech_buffer.clear();
+        if self.status == Status::Speaking {
+            self.status = Status::Idle;
+        }
+        self.input_frozen_draft = Some(std::mem::take(&mut self.input));
+        if self.recording.is_some() {
+            return;
+        }
+        let Some(cmd) = self.cfg.recording.command.clone() else {
+            self.status = Status::Error("sem [recording].command na configuração".into());
+            return;
+        };
+        let tmp_dir = match self.state.as_ref().and_then(|s| s.tmp_dir().ok()) {
+            Some(d) => d,
+            None => std::env::temp_dir(),
+        };
+        let (rec_tx, rec_rx) = mpsc::channel::<RecorderEvent>();
+        let app_tx = self.events_tx.clone();
+        match recorder::start_recording(
+            &cmd,
+            self.cfg.push_to_talk.max_record_secs,
+            &tmp_dir,
+            rec_tx,
+        ) {
+            Ok(active) => {
+                self.recording = Some(active);
+                self.press_at = Some(Instant::now());
+                self.status = Status::Listening;
+                self.diag("[ptt] tecla pressionada: gravando".into());
+                self.log.log_event("ptt", &[("fase", json!("press"))]);
+                let bridge = std::thread::Builder::new()
+                    .name("recorder-bridge".into())
+                    .spawn(move || {
+                        while let Ok(ev) = rec_rx.recv() {
+                            let ev = match ev {
+                                RecorderEvent::Done(r) => AppEvent::RecordDone(r),
+                            };
+                            if app_tx.send(ev).is_err() {
+                                break;
+                            }
+                        }
+                    });
+                if let Err(e) = bridge {
+                    self.diag(format!("fio recorder-bridge não iniciou: {e}"));
+                }
+            }
+            Err(e) => {
+                self.status = Status::Error(format!("gravador falhou: {e}"));
+                self.log.log_error("erro_record", &e.to_string());
+            }
+        }
+    }
+
+    /// Tecla de voz solta: encerra a gravação e dispara a transcrição.
+    pub fn on_key_release(&mut self) {
+        let too_short = self.press_at.is_some_and(|t| {
+            t.elapsed() < Duration::from_millis(self.cfg.push_to_talk.min_press_ms)
+        });
+        self.press_at = None;
+        if too_short {
+            if let Some(rec) = self.recording.as_mut() {
+                rec.stop();
+            }
+            self.recording = None;
+            self.status = Status::Idle;
+            self.diag("[ptt] press mais curto que min_press_ms; descartado".into());
+            self.restore_draft();
+            return;
+        }
+        if let Some(rec) = self.recording.as_mut() {
+            rec.stop();
+            self.status = Status::Transcribing;
+            self.diag("[ptt] tecla solta: transcrevendo".into());
+            self.log.log_event("ptt", &[("fase", json!("release"))]);
+        }
+    }
+
+    /// Após gravar: valida o WAV, roda o Whisper num fio e apaga o temporário.
+    pub fn on_record_done(&mut self, result: Result<recorder::Recording, recorder::RecorderError>) {
+        self.recording = None;
+        match result {
+            Ok(rec) => {
+                self.status = Status::Transcribing;
+                let whisper = WhisperConfig {
+                    command: self.cfg.whisper.command.clone().unwrap_or_default(),
+                    model: self.cfg.whisper.model.clone(),
+                    language: self.cfg.whisper.language.clone(),
+                    timeout_secs: self.cfg.whisper.timeout_secs,
+                    max_chars: self.cfg.whisper.max_chars,
+                    silence_markers: self.cfg.whisper.silence_markers.clone(),
+                };
+                let server = self.cfg.whisper.server_url.clone();
+                let app_tx = self.events_tx.clone();
+                let stt_thread = std::thread::Builder::new()
+                    .name("stt".into())
+                    .spawn(move || {
+                        let outcome = run_stt(&whisper, &rec.path, server);
+                        recorder::remove_recording(&rec.path);
+                        let _ = app_tx.send(AppEvent::Transcribed(outcome));
+                    });
+                if let Err(e) = stt_thread {
+                    self.diag(format!("fio de transcrição não iniciou: {e}"));
+                    self.status = Status::Error("transcrição não iniciou".into());
+                    self.log.log_error("erro_stt", &e.to_string());
+                }
+            }
+            Err(e) => {
+                self.status = Status::Error(format!("gravação inválida: {e}"));
+                self.log.log_error("erro_record", &e.to_string());
+                self.restore_draft();
+            }
+        }
+    }
+
+    /// Após transcrever: envia automaticamente ou informa vazio/erro.
+    pub fn on_transcribed(&mut self, outcome: Result<String, String>) {
+        self.restore_draft();
+        match outcome {
+            Ok(text) if text.trim().is_empty() => {
+                self.info("Não detectei fala nessa gravação.".into());
+                self.status = Status::Idle;
+            }
+            Ok(text) => {
+                if self.pending_prompt.is_some() {
+                    if self.queued_voice.is_none() {
+                        self.queued_voice = Some(text);
+                        self.info(
+                            "O agente está ocupado; a mensagem de voz ficou na fila (uma, no máximo)."
+                                .into(),
+                        );
+                    } else {
+                        self.info("Fila tomada: a nova mensagem de voz foi descartada.".into());
+                    }
+                    self.status = Status::Waiting;
+                } else {
+                    self.send_prompt(&text, true);
+                }
+            }
+            Err(e) => {
+                self.status = Status::Error(format!("transcrição falhou: {e}"));
+                self.log.log_error("erro_stt", &e);
+            }
+        }
+    }
+
+    /// Acumula texto falável e emite frases completas na fila.
+    pub fn speak_accumulated(&mut self, chunk: &str) {
+        self.speech_buffer.push_str(chunk);
+        while let Some(pos) = find_sentence_end(&self.speech_buffer) {
+            let sentence: String = self.speech_buffer.drain(..=pos).collect();
+            self.enqueue_speech(&sentence);
+        }
+    }
+
+    /// Fechamento do turno: fala o resto que ficou no buffer.
+    pub fn flush_speech(&mut self) {
+        let rest = std::mem::take(&mut self.speech_buffer);
+        self.enqueue_speech(&rest);
+    }
+
+    fn enqueue_speech(&mut self, sentence: &str) {
+        let Some(sp) = &self.speaker else { return };
+        for part in prepare_for_speech(sentence) {
+            sp.speak(part);
+        }
+    }
+
+    // ---------- fluxo ACP ----------
+
+    /// Processa uma mensagem do agente. Chame de dentro do loop da TUI.
+    pub fn on_acp(&mut self, inbound: Inbound) {
+        match inbound {
+            Inbound::Closed(reason) => self.connection_lost(&reason),
+            Inbound::AgentRequest { id, method, params } => {
+                if method == "session/request_permission" {
+                    self.open_permission_modal(id, &params);
+                } else {
+                    let reply = self.acp.as_ref().map(|acp| {
+                        acp.reply_error(&id, -32601, "método não suportado pelo cliente")
+                    });
+                    match reply {
+                        None => self.diag(format!(
+                            "requisição do agente sem conexão para responder: {method}"
+                        )),
+                        Some(Err(e)) => self.diag(format!(
+                            "resposta de não suportado para {method} não enviada: {e}"
+                        )),
+                        Some(Ok(())) => {
+                            self.diag(format!("requisição {method} respondida como não suportada"));
+                        }
+                    }
+                }
+            }
+            Inbound::Notification { method, params } => self.on_notification(&method, &params),
+            Inbound::Response { id, result } => self.on_response(id, result),
+        }
+    }
+
+    fn on_notification(&mut self, method: &str, params: &Value) {
+        if method != "session/update" {
+            self.diag(format!(
+                "notificação ignorada: {method} ({})",
+                value_excerpt(params, 200)
+            ));
+            return;
+        }
+        let Some(update) = params.get("update") else {
+            self.diag(format!(
+                "session/update sem campo update: {}",
+                value_excerpt(params, 200)
+            ));
+            return;
+        };
+        match SessionUpdate::parse(update) {
+            SessionUpdate::AgentMessageChunk { text } => {
+                let chunk = match self.chat.last_mut() {
+                    Some(last) if last.author == Author::Agent => {
+                        last.text.push_str(&text);
+                        text
+                    }
+                    _ => {
+                        self.chat.push(ChatItem {
+                            author: Author::Agent,
+                            text: text.clone(),
+                        });
+                        text
+                    }
+                };
+                self.trim_chat();
+                self.follow_tail = true;
+                self.speak_accumulated(&chunk);
+            }
+            SessionUpdate::ToolCall { title, status } => {
+                self.chat.push(ChatItem {
+                    author: Author::Info,
+                    text: format!("ferramenta: {title} — {status}"),
+                });
+                self.trim_chat();
+                self.follow_tail = true;
+            }
+            SessionUpdate::ToolCallUpdate {
+                tool_call_id,
+                status,
+            } => {
+                if let Some(item) = self
+                    .chat
+                    .iter_mut()
+                    .rev()
+                    .find(|i| i.author == Author::Info && i.text.contains(&tool_call_id))
+                {
+                    item.text = format!("ferramenta: ({status}) {}", tool_call_id);
+                }
+            }
+            SessionUpdate::Unknown(kind) => {
+                self.log
+                    .log_event("acp", &[("update_desconhecido", json!(kind))]);
+                self.diag(format!("update desconhecido do agente: {kind}"));
+            }
+        }
+    }
+
+    fn on_response(&mut self, id: u64, result: Result<Value, RpcError>) {
+        if self.init_phase.is_some() {
+            self.on_handshake_response(result);
+            return;
+        }
+        if self.pending_prompt == Some(id) {
+            self.pending_prompt = None;
+            match result {
+                Ok(v) => {
+                    let stop = v
+                        .get("stopReason")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    self.log.log_event("turno", &[("stop", json!(stop))]);
+                    self.flush_speech();
+                    if stop == "cancelled" {
+                        self.info("Turno cancelado.".into());
+                    }
+                    self.status = Status::Idle;
+                    if let Some(queued) = self.queued_voice.take() {
+                        self.send_prompt(&queued, true);
+                    }
+                }
+                Err(e) => match e.outcome() {
+                    ErrorOutcome::SessionBusy => {
+                        self.info("O agente já estava ocupado; a mensagem não foi aceita.".into());
+                        self.status = Status::Idle;
+                    }
+                    ErrorOutcome::SessionExpiredOrUnknown => {
+                        self.info("Sessão expirou ou não existe; abrindo outra…".into());
+                        self.retry_text = self.last_user_text();
+                        self.session_id = None;
+                        self.begin_new_session();
+                    }
+                    ErrorOutcome::Other => {
+                        self.info(format!("Erro do daemon: {}", e.message));
+                        self.status = Status::Idle;
+                    }
+                },
+            }
+            if self.pending_permission.is_some() {
+                self.status = Status::Approval;
+            }
+            return;
+        }
+        if let Some(phase) = self.session_phase {
+            self.on_session_response(id, result, phase);
+            return;
+        }
+        self.diag(format!(
+            "resposta sem requisição em aberto (id={id}): {}",
+            match &result {
+                Ok(v) => value_excerpt(v, 200),
+                Err(e) => format!("erro {} ({})", e.code, e.message),
+            }
+        ));
+    }
+
+    /// Após falha de load/resume (ou ausência de sessão salva): sessão nova.
+    pub fn begin_new_session(&mut self) {
+        self.init_phase = Some(InitPhase::CreatingSession);
+        self.session_phase = Some(InitPhase::CreatingSession);
+        self.phase_started_at = Some(Instant::now());
+        let sent = self.acp.as_mut().and_then(|acp| {
+            match acp.send_request("session/new", json!({ "agentAlias": self.agent_alias })) {
+                Ok(_) => None,
+                Err(e) => Some(e.to_string()),
+            }
+        });
+        match sent {
+            None => self.diag("session/new enviado".into()),
+            Some(e) if self.acp.is_some() => self.connection_lost(&e),
+            Some(_) => self.diag("session/new não enviado: sem conexão".into()),
+        }
+    }
+
+    /// Durante o handshake: initialize → load/resume → session/new.
+    fn on_handshake_response(&mut self, result: Result<Value, RpcError>) {
+        match self.init_phase {
+            Some(InitPhase::Initializing) => {
+                if let Err(e) = result {
+                    self.connection_lost(&format!("initialize falhou: {}", e.message));
+                    return;
+                }
+                let v = result.unwrap_or(Value::Null);
+                let version = v
+                    .get("protocolVersion")
+                    .and_then(|p| p.as_u64())
+                    .unwrap_or(0);
+                if version != crate::acp::types::PROTOCOL_VERSION {
+                    self.info(format!(
+                        "Aviso: versão do protocolo ACP é {version}, esperado {} — pode falhar.",
+                        crate::acp::types::PROTOCOL_VERSION
+                    ));
+                }
+                let audio = v
+                    .pointer("/capabilities/promptCapabilities/audio")
+                    .and_then(|a| a.as_bool())
+                    .unwrap_or(false);
+                self.log.log_event("capacidade", &[("audio", json!(audio))]);
+                if audio {
+                    self.info(
+                        "O agente anuncia capacidade de áudio; este cliente segue mandando texto."
+                            .into(),
+                    );
+                }
+                let saved = match self
+                    .state
+                    .as_ref()
+                    .map(|s| s.load_session(&self.agent_alias))
+                {
+                    None => {
+                        self.diag("sem state_dir: sessão anterior não é retomada".into());
+                        None
+                    }
+                    Some(Err(e)) => {
+                        self.diag(format!("falha ao ler sessão salva: {e}"));
+                        None
+                    }
+                    Some(Ok(saved)) => saved,
+                };
+                match saved {
+                    Some(sid) if !sid.is_empty() => {
+                        self.init_phase = Some(InitPhase::Resuming);
+                        self.session_phase = Some(InitPhase::Resuming);
+                        self.phase_started_at = Some(Instant::now());
+                        self.diag(format!("sessão salva encontrada; tentando retomar ({sid})"));
+                        let params = json!({ "sessionId": sid.clone() });
+                        let load_err = self.acp.as_mut().and_then(|acp| {
+                            // VERIFY: os docs citam session/load e session/resume;
+                            // tentamos load e, se o método não existir, resume.
+                            match acp.send_request("session/load", params.clone()) {
+                                Ok(_) => None,
+                                Err(e) => Some(e.to_string()),
+                            }
+                        });
+                        if let Some(e) = load_err {
+                            self.diag(format!(
+                                "session/load não foi enviado ({e}); tentando session/resume"
+                            ));
+                            let params = json!({ "sessionId": sid });
+                            if let Some(e) = self.acp.as_mut().and_then(|acp| {
+                                match acp.send_request("session/resume", params) {
+                                    Ok(_) => None,
+                                    Err(e) => Some(e.to_string()),
+                                }
+                            }) {
+                                self.diag(format!("session/resume também não foi enviado: {e}"));
+                            }
+                        }
+                    }
+                    _ => self.begin_new_session(),
+                }
+            }
+            Some(InitPhase::Resuming) | Some(InitPhase::CreatingSession) => {
+                let phase = self.init_phase.unwrap();
+                self.on_session_response(0, result, phase);
+            }
+            None => {}
+        }
+    }
+
+    /// Respostas de session/load/resume/new.
+    fn on_session_response(&mut self, _id: u64, result: Result<Value, RpcError>, phase: InitPhase) {
+        match result {
+            Ok(v) => {
+                let sid = v
+                    .get("sessionId")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if sid.is_empty() {
+                    self.connection_lost("resposta de sessão sem sessionId");
+                    return;
+                }
+                if phase == InitPhase::Resuming {
+                    self.info("Sessão anterior retomada.".into());
+                } else {
+                    self.info("Sessão nova criada.".into());
+                }
+                self.session_id = Some(sid.clone());
+                if let Some(state) = self.state.as_ref() {
+                    if let Err(e) = state.save_session(&self.agent_alias, &sid) {
+                        self.diag(format!(
+                            "falha ao salvar a sessão no disco: {e} (continuando sem persistência)"
+                        ));
+                    }
+                }
+                self.init_phase = None;
+                self.session_phase = None;
+                self.phase_started_at = None;
+                self.status = Status::Idle;
+                self.reconnect_at = None;
+                if let Some(text) = self.retry_text.take() {
+                    self.send_prompt(&text, false);
+                }
+            }
+            Err(e) if phase == InitPhase::Resuming => {
+                self.log
+                    .log_error("erro", &format!("resume falhou: {}", e.message));
+                self.info("Não deu para retomar a sessão anterior; abrindo outra…".into());
+                self.begin_new_session();
+            }
+            Err(e) => {
+                self.connection_lost(&format!("session/new falhou: {}", e.message));
+            }
+        }
+    }
+
+    /// Texto da última mensagem do usuário (para reenvio pós reconexão).
+    fn last_user_text(&self) -> Option<String> {
+        self.chat
+            .iter()
+            .rev()
+            .find(|i| i.author == Author::User)
+            .map(|i| i.text.trim_end_matches("  (por voz)").to_string())
+    }
+
+    // ---------- teclado ----------
+
+    /// Digitação normal (chamado só quando a tecla de voz NÃO está mantida).
+    pub fn on_key(&mut self, key: ParsedKey) {
+        use ParsedKey::*;
+        if self.pending_permission.is_some() {
+            match key {
+                Quit => self.quit = true,
+                Cancel => self.answer_permission(true),
+                Submit => self.answer_permission(false),
+                ModalUp => {
+                    if let Some(m) = self.pending_permission.as_mut() {
+                        m.selected = m.selected.saturating_sub(1);
+                    }
+                }
+                ModalDown => {
+                    if let Some(m) = self.pending_permission.as_mut() {
+                        m.selected = (m.selected + 1).min(m.options.len().saturating_sub(1));
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key {
+            Quit => self.quit = true,
+            Cancel => self.on_cancel(),
+            Submit => {
+                if self.input.trim().is_empty() {
+                    self.diag("Enter com caixa vazia: nada enviado".into());
+                    return;
+                }
+                if self.pending_prompt.is_some() {
+                    self.info(
+                        "O agente ainda está respondendo; aguarde ou Esc para cancelar.".into(),
+                    );
+                    return;
+                }
+                let text = std::mem::take(&mut self.input);
+                self.send_prompt(&text, false);
+            }
+            ScrollUp => {
+                self.scroll_offset = self.scroll_offset.saturating_add(3);
+            }
+            ScrollDown => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+            }
+            Backspace => {
+                self.input.pop();
+            }
+            InsertChar(c) => {
+                if !c.is_control() {
+                    self.input.push(c);
+                }
+            }
+            Paste(text) => {
+                for c in sanitize::strip_escapes_and_control(&text).chars() {
+                    self.input.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_cancel(&mut self) {
+        if self.pending_permission.is_some() {
+            self.answer_permission(true);
+        } else if self.status == Status::Waiting && self.cfg.acp.esc_cancels {
+            let session = self.session_id.clone().unwrap_or_default();
+            if let Some(acp) = self.acp.as_ref() {
+                let _ = acp.send_notification("session/cancel", json!({ "sessionId": session }));
+            }
+            self.status = Status::Idle;
+        } else if self.status == Status::Speaking {
+            if let Some(sp) = &self.speaker {
+                sp.interrupt();
+            }
+            self.status = Status::Idle;
+        } else {
+            self.diag(format!(
+                "Esc sem efeito no estado atual (status={:?})",
+                self.status
+            ));
+        }
+    }
+
+    /// Drena as mensagens do agente para dentro do aplicativo (usado pela
+    /// TUI e pelos testes). Devolve quantas mensagens foram processadas.
+    pub fn pump_acp(&mut self, wait: Duration) -> usize {
+        let mut n = 0;
+        loop {
+            if self.acp.is_none() {
+                break;
+            }
+            let msg = {
+                let acp = self.acp.as_mut().expect("verificado acima");
+                acp.recv_timeout(wait)
+            };
+            match msg {
+                Some(inbound) => {
+                    self.on_acp(inbound);
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        n
+    }
+
+    /// Exposto para os testes: resposta direta sem passar pelo fio leitor.
+    pub fn handle_response_direct(&mut self, id: u64, result: Result<Value, RpcError>) {
+        let saved = self.init_phase;
+        self.init_phase = None;
+        self.on_response(id, result);
+        self.init_phase = saved;
+    }
+
+    /// Reconexão em ticks (o tempo passou).
+    pub fn on_tick(&mut self) {
+        if self.acp.is_none() && self.reconnect_at.is_some_and(|t| Instant::now() >= t) {
+            self.connect();
+        }
+        if let Some(started) = self.phase_started_at {
+            let wait = Duration::from_secs(self.cfg.acp.handshake_timeout_secs.max(1));
+            let elapsed = started.elapsed();
+            if elapsed >= wait {
+                self.diag(format!(
+                    "handshake sem resposta há {}s ({}) — o cliente não derruba a conexão; observe o daemon",
+                    elapsed.as_secs(),
+                    phase_name(self.init_phase)
+                ));
+                self.phase_started_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Erro de praxe da fonte da tecla: journal sempre, tela em verboso.
+    pub fn on_key_source_failed(&mut self, reason: String) {
+        self.log.log_error("erro_ptt", &reason);
+        if self.verbose {
+            self.chat.push(ChatItem {
+                author: Author::Diag,
+                text: format!("[ptt] linha da tecla falhou: {reason}"),
+            });
+            self.trim_chat();
+            self.follow_tail = true;
+        }
+    }
+}
+
+fn phase_name(phase: Option<InitPhase>) -> &'static str {
+    match phase {
+        Some(InitPhase::Initializing) => "aguardando resposta de initialize",
+        Some(InitPhase::Resuming) => "aguardando resposta de session/load",
+        Some(InitPhase::CreatingSession) => "aguardando resposta de session/new",
+        None => "sem fase",
+    }
+}
+
+fn value_excerpt(v: &Value, n: usize) -> String {
+    let s = v.to_string();
+    if s.chars().count() <= n {
+        s
+    } else {
+        let t: String = s.chars().take(n).collect();
+        format!("{t}…")
+    }
+}
+
+fn run_stt(
+    whisper: &WhisperConfig,
+    audio: &std::path::Path,
+    server: Option<String>,
+) -> Result<String, String> {
+    match (&server, whisper.command.is_empty()) {
+        (Some(url), _) => {
+            stt::transcribe_server(url, audio, whisper.timeout_secs).map_err(|e| e.to_string())
+        }
+        (None, false) => stt::transcribe(whisper, audio).map_err(|e| e.to_string()),
+        (None, true) => {
+            Err("nem [whisper].command nem [whisper].server_url estão configurados".into())
+        }
+    }
+    .map(|t| stt::strip_silence_markers(&t, &whisper.silence_markers).unwrap_or_default())
+    .map(|t| sanitize::cap_chars(&t, whisper.max_chars))
+}
+
+/// Procura o fim de sentença dentro do buffer; devolve o índice (em bytes).
+fn find_sentence_end(buffer: &str) -> Option<usize> {
+    for (idx, c) in buffer.char_indices() {
+        if matches!(c, '.' | '!' | '?' | '\u{2026}') {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+impl ChatItem {
+    pub fn rendered(&self) -> String {
+        sanitize::strip_escapes_and_control(&self.text)
+    }
+}
