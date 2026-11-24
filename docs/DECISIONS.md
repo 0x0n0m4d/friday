@@ -164,6 +164,40 @@ proibido continua proibido (D12): nenhum prompt, transcrição, texto do modelo 
 
 ---
 
+## D14. Lembrete de tool call por turno (`[agent].tool_reminder`)
+
+**Problema observado em campo (2026-11-23):** com `nvidia/nemotron-3-ultra-550b-a55b:free`, o agente
+respondia "File created successfully" dentro de blocos bash/text em markdown, no texto puro. O
+runtime-trace do daemon mostrava `native_tool_calls: 0`, `parsed_tool_calls: 0` — nenhuma ferramenta
+foi pedida, logo nenhum `session/request_permission` pôde disparar. O parser do ZeroClaw
+(`zeroclaw-tool-call-parser`) só reconhece `<tool_call>` XML e formato JSON de tool call; blocos
+markdown de bash NÃO são parseados nem descartados. Não é um bug de permissão nem da sexta-feira.
+
+**Evidências consultadas em 2026-11-23:**
+
+- API da OpenRouter (`/api/v1/models/<id>/endpoints`): o modelo usado declara `tools` e
+  `tool_choice` em `supported_parameters` — ou seja, a capacidade EXISTE, mas o modelo a ignora na
+  prática (comportamento típico de modelos gratuitos).
+- Docs do ZeroClaw (docs.zeroclaw.com, ex-wiki 05.1/05.4 e PR #11740): providers com
+  `native_tool_calling` (openai, anthropic, openrouter, gemini) mandam tool specs nativas; providers
+  `custom` caem no modo prompt-guided POR PADRÃO a menos que `native_tools = true`.
+
+**Decisão:** contorno no lado do cliente, como parte do payload — `[agent].tool_reminder` (padrão
+ligado) prefixa uma regra curta e fixa a cada turno ordenando o uso do protocolo de ferramentas e
+proibindo simular resultados. Motivos:
+
+- resolve para QUALQUER provider/modelo escolhido pelo usuário, inclusive grátis; não exige rebuild
+  do daemon nem trocar de modelo imediatamente;
+- o lembrete é configurável (`tool_reminder_text`) e desligável (`tool_reminder = false`) — quando o
+  usuário passar para um modelo que respeita tool calls, pode economizar os tokens;
+- o texto do usuário continua intacto no chat, no reenvio pós-reconexão e no limite
+  `prompt_max_chars` — o lembrete é acrescentado só imediatamente antes do envio.
+
+Limitação assumida: é um empurrão, não uma garantia — modelo insuficiente pode continuar errando o
+formato; caminho de fundo é trocar de modelo ou ajustar o provider no lado do ZeroClaw.
+
+---
+
 ## Itens VERIFY (incertos que dependem da instalação do usuário)
 
 | Item | Onde | Por quê |

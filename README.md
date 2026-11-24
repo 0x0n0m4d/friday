@@ -189,7 +189,27 @@ O restante do fluxo (gravar → transcrever → enviar → falar) é idêntico.
 ### 4.2 Lembrete de ferramenta (`[agent]`)
 
 O modal de permissão só aparece quando o modelo emite uma **tool call de verdade** que o ZeroClaw
-reconhece (formato `
+reconhece (formato `<tool_call>` XML ou JSON de tool call). Se o modelo responde com um bloco
+bloco de código bash em markdown fingindo que executou, o ZeroClaw não tem nada para aprovar: `parsed_tool_calls: 0`
+e nada acontece. A API da OpenRouter confirma que muitos modelos `:free` **declaram** suporte a
+`tools` (verifique em `openrouter.ai/api/v1/models/<id>/endpoints`: `supported_parameters` deve conter
+`tools`), mas mesmo assim erram o formato na prática — o lembrete por turno existe exatamente para
+empurrar esses modelos para o caminho certo.
+
+- `tool_reminder = true` (padrão): cada prompt sai prefixado com uma linha de regra (ver
+  `DEFAULT_TOOL_REMINDER` em `src/config.rs`). O lembrete NÃO aparece no chat nem conta para o
+  reenvio — só vai no payload para o daemon.
+- `tool_reminder_text`: troque para usar a sua própria instrução (por exemplo em inglês, se o seu
+  agente opera em inglês).
+- `tool_reminder = false`: desliga (recomendado só para modelos que já chamam ferramentas bem).
+
+Complementos no lado do **ZeroClaw** (sem rebuild da sexta-feira): um provider `custom` cai no modo
+prompt-guided por padrão — se o endpoint é compatível com OpenAI e aceita `tools`, ponha
+`native_tools = true` no provider para usar chamadas nativas; e/ou reforce a persona do agente com a
+mesma regra. Trocar para um modelo gratuito que responde bem a tool calls (procure
+`supported_parameters=tools` na OpenRouter) reduz a dependência do lembrete.
+
+### 4.3 O que NÃO configurar aqui
 
 Qualquer segredo. Este projeto não tem chave nenhuma embutida; o token do gateway vem do ambiente,
 quando você quiser: aponte o **nome** da variável em `[acp].token_env` (por exemplo
@@ -290,7 +310,7 @@ Os sete cenários manuais com o daemon real estão em `docs/TESTING.md`.
 
   ```udev
   # /etc/udev/rules.d/85-sexta-ptt.rules
-  SUBSYSTEM=="input", ATTRS{name}=="*<nome do seu teclado>*", \
+  SUBSYSTEM=="input", ATTRS{name}=="*<nome do seu teclado>*", \\
     KERNEL=="event*", MODE="0640", GROUP="sexta-ptt"
   ```
 
