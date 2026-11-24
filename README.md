@@ -189,8 +189,7 @@ O restante do fluxo (gravar → transcrever → enviar → falar) é idêntico.
 ### 4.2 Lembrete de ferramenta (`[agent]`)
 
 O modal de permissão só aparece quando o modelo emite uma **tool call de verdade** que o ZeroClaw
-reconhece (formato `<tool_call>` XML ou JSON de tool call). Se o modelo responde com um bloco
-bloco de código bash em markdown fingindo que executou, o ZeroClaw não tem nada para aprovar: `parsed_tool_calls: 0`
+reconhece (formato `<tool_call>` XML ou JSON de tool call). Se o modelo responde com um bloco de código bash em markdown fingindo que executou, o ZeroClaw não tem nada para aprovar: `parsed_tool_calls: 0`
 e nada acontece. A API da OpenRouter confirma que muitos modelos `:free` **declaram** suporte a
 `tools` (verifique em `openrouter.ai/api/v1/models/<id>/endpoints`: `supported_parameters` deve conter
 `tools`), mas mesmo assim erram o formato na prática — o lembrete por turno existe exatamente para
@@ -209,7 +208,27 @@ prompt-guided por padrão — se o endpoint é compatível com OpenAI e aceita `
 mesma regra. Trocar para um modelo gratuito que responde bem a tool calls (procure
 `supported_parameters=tools` na OpenRouter) reduz a dependência do lembrete.
 
-### 4.3 O que NÃO configurar aqui
+### 4.3 Recarga e reconexão de sessão (o que acontece ao abrir de novo)
+
+A tela de conversa é **um log individual: um mostrador de mensagens, e só isso**. Ela não é
+influenciada pelo modelo nem pela conexão — quem decide o que entra nela é o fluxo abaixo.
+
+**Abertura (primeira carga da execução):** ao abrir a sexta-feira com uma sessão salva, o daemon
+reenvia o histórico completo e o cliente **mostra a sessão inteira na tela — e ponto final, só
+isso**:
+- nada é falado no Piper (o histórico é mudo);
+- nenhuma mensagem é reenviada ao agente (não existe opção de "repetir" uma mensagem);
+- a voz volta **somente** quando VOCÊ manda uma mensagem nova (voz ou teclado).
+
+**Reconexão (queda em pleno uso):** se a conexão cai e o cliente retoma a sessão automaticamente,
+**o replay do histórico é descartado**. A tela já mostra a sessão inteira — ela é o log oficial —
+então nada é reexibido, nada é falado e nada se duplica: a conversa continua a partir da última
+mensagem que já estava na tela. Você é avisado de que a sessão foi retomada; a voz volta no
+próximo prompt seu.
+
+Se a recarga não for a que você quer, use `--new-session` para começar do zero.
+
+### 4.4 O que NÃO configurar aqui
 
 Qualquer segredo. Este projeto não tem chave nenhuma embutida; o token do gateway vem do ambiente,
 quando você quiser: aponte o **nome** da variável em `[acp].token_env` (por exemplo
@@ -310,7 +329,7 @@ Os sete cenários manuais com o daemon real estão em `docs/TESTING.md`.
 
   ```udev
   # /etc/udev/rules.d/85-sexta-ptt.rules
-  SUBSYSTEM=="input", ATTRS{name}=="*<nome do seu teclado>*", \\
+  SUBSYSTEM=="input", ATTRS{name}=="*<nome do seu teclado>*", \
     KERNEL=="event*", MODE="0640", GROUP="sexta-ptt"
   ```
 

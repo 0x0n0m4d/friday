@@ -65,6 +65,12 @@ pub enum SessionUpdate {
     AgentMessageChunk {
         text: String,
     },
+    /// Parte de mensagem do USUÁRIO. Só aparece no replay de sessão
+    /// (session/load): o daemon reenvia o histórico salvo, inclusive o que
+    /// o usuário disse. Exibimos; nunca falamos nem reenviamos.
+    UserMessageChunk {
+        text: String,
+    },
     ToolCall {
         title: String,
         status: String,
@@ -103,6 +109,9 @@ impl SessionUpdate {
             .unwrap_or("");
         match kind {
             "agent_message_chunk" => SessionUpdate::AgentMessageChunk {
+                text: content_text(update),
+            },
+            "user_message_chunk" => SessionUpdate::UserMessageChunk {
                 text: content_text(update),
             },
             "tool_call" => SessionUpdate::ToolCall {
@@ -236,6 +245,16 @@ mod tests {
                     other => panic!("tipo errado: {other:?}"),
                 }
             }
+            other => panic!("tipo errado: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_update_do_usuario_historico() {
+        let upd = json!({"sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"linha do histórico"}});
+        match SessionUpdate::parse(&upd) {
+            SessionUpdate::UserMessageChunk { text } => assert_eq!(text, "linha do histórico"),
             other => panic!("tipo errado: {other:?}"),
         }
     }

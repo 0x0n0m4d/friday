@@ -148,6 +148,159 @@ fn retoma_sessao_salva_no_segundo_start() {
 }
 
 #[test]
+fn recarga_mostra_historico_sem_falar_nem_repetir() {
+    // Regra de casa da recarga: session/load devolve o histórico salvo; o
+    // cliente mostra a sessão inteira na tela e SÓ isso — sem Piper falando,
+    // sem reenvio, sem interação. A fala volta exclusivamente no próximo
+    // prompt do usuário.
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let (mut app, _rx, _sim) = make_app(&[], tmp.path());
+        app.start();
+        espera_ocioso(&mut app);
+        app.teardown();
+    }
+    let (mut app, _rx, _sim) = make_app(&["--load-replay"], tmp.path());
+    app.start();
+    // O status inicial é Idle, então espera_ocioso não serve aqui: esperamos
+    // o MARCADOR de retomada (chega depois do replay inteiro, na resposta do
+    // session/load). O replay NÃO pode falar nem repetir nada.
+    pump_until(
+        &mut app,
+        |a| {
+            a.chat
+                .iter()
+                .any(|i| i.text.contains("Sessão anterior retomada"))
+        },
+        "recarga deveria responder com a sessão na tela",
+    );
+    espera_ocioso(&mut app);
+
+    assert!(
+        app.chat
+            .iter()
+            .any(|i| i.author == Author::User && i.text.contains("capital do Brasil")),
+        "histórico do USUÁRIO deveria aparecer na tela: {:?}",
+        app.chat
+    );
+    assert!(
+        app.chat
+            .iter()
+            .any(|i| i.author == Author::Agent && i.text.contains("Brasília")),
+        "histórico do AGENTE deveria aparecer na tela: {:?}",
+        app.chat
+    );
+    assert_eq!(
+        app.falas_enfileiradas, 0,
+        "histórico NÃO deveria ir para o Piper: {:?}",
+        app.chat
+    );
+    assert_eq!(
+        app.chat
+            .iter()
+            .filter(|i| i.author == Author::Agent && i.text.contains("Brasília"))
+            .count(),
+        1,
+        "histórico deveria aparecer UMA vez, sem repetição: {:?}",
+        app.chat
+    );
+
+    // Fala volta só quando o USUÁRIO manda uma mensagem própria.
+    assert!(app.send_prompt("pode falar de novo?", false));
+    espera_ocioso(&mut app);
+    assert!(
+        app.falas_enfileiradas >= 1,
+        "novo turno deveria voltar a falar: {:?}",
+        app.chat
+    );
+    app.teardown();
+}
+
+#[test]
+fn reconexao_nao_toca_na_tela_do_historico() {
+    // Regra de casa da RECONEXÃO (diferente da recarga na abertura): a tela
+    // é o log oficial das mensagens — "só um mostrador". Se a conexão cai e
+    // o cliente retoma a sessão em pleno uso, o replay que o daemon devolve
+    // no session/load é ENGOLIDO: nada entra na tela, nada fala, nada se
+    // duplica. A conversa segue da última mensagem já exibida; a fala volta
+    // só no próximo prompt do usuário.
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let (mut app, _rx, _sim) = make_app(&[], tmp.path());
+        app.start();
+        espera_ocioso(&mut app);
+        app.teardown();
+    }
+    let (mut app, _rx, _sim) = make_app(&["--load-replay"], tmp.path());
+    app.start();
+    pump_until(
+        &mut app,
+        |a| {
+            a.chat
+                .iter()
+                .any(|i| i.text.contains("Sessão anterior retomada"))
+        },
+        "abertura deveria reconstruir a tela com o histórico",
+    );
+    espera_ocioso(&mut app);
+    let brasilia = |a: &mut App| {
+        a.chat
+            .iter()
+            .filter(|i| i.author == Author::Agent && i.text.contains("Brasília"))
+            .count()
+    };
+    assert_eq!(brasilia(&mut app), 1, "histórico na tela UMA vez");
+
+    // Queda em pleno uso + reconexão: é aí que o replay tem de ser engolido.
+    app.connection_lost("queda simulada");
+    app.reconnect_at = Some(Instant::now() - Duration::from_millis(1));
+    app.on_tick();
+    assert!(app.acp.is_some(), "deve reconectar quando o prazo passa");
+    pump_until(
+        &mut app,
+        |a| a.session_id.is_some() && a.init_phase.is_none(),
+        "reconexão deveria retomar a sessão",
+    );
+    espera_ocioso(&mut app);
+
+    assert!(
+        app.chat
+            .iter()
+            .any(|i| i.text.contains("a tela segue de onde parou")),
+        "usuário deveria ser avisado de que a tela não recarrega: {:?}",
+        app.chat
+    );
+    assert_eq!(
+        brasilia(&mut app),
+        1,
+        "reconexão NÃO deveria reexibir o histórico: {:?}",
+        app.chat
+    );
+    assert_eq!(
+        app.falas_enfileiradas, 0,
+        "replay engolido NÃO deveria falar: {:?}",
+        app.chat
+    );
+
+    // A conversa segue da última mensagem: próximo prompt do usuário fala
+    // de novo e a tela continua sem duplicação.
+    assert!(app.send_prompt("seguir daqui", false));
+    espera_ocioso(&mut app);
+    assert!(
+        app.falas_enfileiradas >= 1,
+        "fala volta no prompt do usuário: {:?}",
+        app.chat
+    );
+    assert_eq!(
+        brasilia(&mut app),
+        1,
+        "histórico continua integral, sem repetição: {:?}",
+        app.chat
+    );
+    app.teardown();
+}
+
+#[test]
 fn voz_enquanto_ocupado_fica_na_fila_e_vai_depois() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, _rx, _sim) = make_app(&[], tmp.path());
@@ -221,6 +374,47 @@ fn sessao_expirada_recria_sessao_e_reenvia() {
         "resposta do reenvio deveria chegar"
     );
     assert_eq!(app.session_id.as_deref(), Some("s-mock-1"));
+    app.teardown();
+}
+
+#[test]
+fn sessao_sempre_expirada_para_apos_um_reenvio() {
+    // Regressão do loop de reenvio: quando o daemon recusa TODO prompt como
+    // "sessão desconhecida/expirada", o cliente recriava a sessão e reenviava
+    // a mesma mensagem sem fim (o chat enchia de repetições). A trava anti-loop
+    // só permite UM reenvio automático; na segunda recusa ele desiste com aviso.
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _rx, _sim) = make_app(&["--prompt-always-unknown-session"], tmp.path());
+    app.start();
+    espera_ocioso(&mut app);
+
+    assert!(app.send_prompt("pergunta eterna", false));
+    pump_until(
+        &mut app,
+        |a| {
+            a.chat
+                .iter()
+                .any(|i| i.author == Author::Info && i.text.contains("desisto do reenvio"))
+        },
+        "cliente deveria desistir do reenvio (trava anti-loop)",
+    );
+    espera_ocioso(&mut app);
+
+    let user_msgs = app
+        .chat
+        .iter()
+        .filter(|i| i.author == Author::User && i.text.contains("pergunta eterna"))
+        .count();
+    assert_eq!(
+        user_msgs, 2,
+        "exatamente o envio original e o ÚNICO reenvio automático; chat: {:?}",
+        app.chat
+    );
+    assert_eq!(
+        app.session_id.as_deref(),
+        Some("s-mock-1"),
+        "sessão nova deveria ficar pronta para o próximo envio manual"
+    );
     app.teardown();
 }
 

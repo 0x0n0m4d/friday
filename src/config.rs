@@ -717,10 +717,7 @@ url = "ws://127.0.0.1:42617/acp"
     fn lembrete_de_ferramenta_ligado_por_padrao() {
         let cfg: Config = toml::from_str(BASE).unwrap();
         assert!(cfg.agent.tool_reminder);
-        assert_eq!(
-            cfg.agent.reminder_line(),
-            Some(DEFAULT_TOOL_REMINDER)
-        );
+        assert_eq!(cfg.agent.reminder_line(), Some(DEFAULT_TOOL_REMINDER));
     }
 
     #[test]

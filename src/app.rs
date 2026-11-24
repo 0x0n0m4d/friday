@@ -106,6 +106,26 @@ pub struct App {
     pub reconnect_attempt: u32,
     pub reconnect_at: Option<Instant>,
     pub retry_text: Option<String>,
+    /// Anti-loop: no MÁXIMO um reenvio automático em sequência. Zera quando um
+    /// turno completa; se a PRÓXIMA sessão também expirar, o cliente desiste do
+    /// reenvio automático (a sessão era recriada e a mensagem reenviada sem
+    /// limite, aparecendo como repetição infinita no chat).
+    pub retry_used: bool,
+    /// Recarga de sessão: enquanto ligado, chegadas de `session/update` são
+    /// HISTÓRICO vindo do daemon (replay de session/load): entram só na tela.
+    /// Sem Piper, sem reenvio, sem interação. Desliga somente quando o usuário
+    /// manda uma mensagem própria — aí os próximos chunks voltam a ser falados.
+    pub historico_silencioso: bool,
+    /// Verdadeiro depois do PRIMEIRO handshake completo desta execução. Nova
+    /// carga de sessão depois disso é RECONEXÃO — e reconexão não toca na
+    /// tela: o chat é o log oficial das mensagens, e o replay do daemon sai
+    /// de fora (a conversa segue da última mensagem já exibida).
+    pub ja_carregou: bool,
+    /// Reconexão em curso: durante o replay de session/load NADA entra na
+    /// tela (não exibe, não fala) — ela já mostra a sessão inteira.
+    pub engolir_replay: bool,
+    /// Contador observável (testes/diag) de frases de fato enfileiradas para voz.
+    pub falas_enfileiradas: usize,
     /// Verboso (`--verbose`): diags de praxe aparecem na tela; journal os
     /// registra sempre, com ou sem a opção.
     pub verbose: bool,
@@ -149,6 +169,11 @@ impl App {
             reconnect_attempt: 0,
             reconnect_at: None,
             retry_text: None,
+            retry_used: false,
+            historico_silencioso: false,
+            ja_carregou: false,
+            engolir_replay: false,
+            falas_enfileiradas: 0,
             verbose: false,
             phase_started_at: None,
             quit: false,
@@ -353,6 +378,8 @@ impl App {
         self.init_phase = None;
         self.session_phase = None;
         self.phase_started_at = None;
+        self.historico_silencioso = false;
+        self.engolir_replay = false;
         self.speech_buffer.clear();
         let base = self.cfg.limits.reconnect_backoff_min_ms;
         let max = self.cfg.limits.reconnect_backoff_max_ms;
@@ -405,6 +432,9 @@ impl App {
             self.status = Status::Idle;
             return false;
         }
+        // O usuário está falando de novo: o que chegar daqui por diante é
+        // resposta viva, não histórico (recarga de sessão volta a falar).
+        self.historico_silencioso = false;
         // Contorno para modelos que respondem com bash em markdown em vez de
         // chamar ferramentas: o lembrete ([agent].tool_reminder) vira a
         // primeira linha do payload, mas não aparece no chat nem no reenvio
@@ -415,8 +445,7 @@ impl App {
         };
         if payload != sanitized {
             self.diag(
-                "[agent] lembrete de tool call anexado ao prompt ([agent].tool_reminder)"
-                    .into(),
+                "[agent] lembrete de tool call anexado ao prompt ([agent].tool_reminder)".into(),
             );
         }
         let Some(session_id) = self.session_id.clone() else {
@@ -694,8 +723,13 @@ impl App {
     }
 
     fn enqueue_speech(&mut self, sentence: &str) {
+        let parts = prepare_for_speech(sentence);
+        if parts.is_empty() {
+            return;
+        }
+        self.falas_enfileiradas += parts.len();
         let Some(sp) = &self.speaker else { return };
-        for part in prepare_for_speech(sentence) {
+        for part in parts {
             sp.speak(part);
         }
     }
@@ -748,6 +782,10 @@ impl App {
         };
         match SessionUpdate::parse(update) {
             SessionUpdate::AgentMessageChunk { text } => {
+                if self.engolir_replay {
+                    return; // reconexão: a tela é o log; replay não entra
+                }
+                let replay = self.historico_silencioso; // histórico entra na tela, nunca fala
                 let chunk = match self.chat.last_mut() {
                     Some(last) if last.author == Author::Agent => {
                         last.text.push_str(&text);
@@ -763,9 +801,28 @@ impl App {
                 };
                 self.trim_chat();
                 self.follow_tail = true;
-                self.speak_accumulated(&chunk);
+                if !replay {
+                    self.speak_accumulated(&chunk);
+                }
+            }
+            SessionUpdate::UserMessageChunk { text } => {
+                if self.engolir_replay {
+                    return; // reconexão: a linha do usuário também fica de fora
+                }
+                // Só chega em replay de session/load: linha do histórico do
+                // próprio usuário. Exibe; mensagem de história não repete,
+                // não fala e não progride fila de reenvio alguma.
+                self.chat.push(ChatItem {
+                    author: Author::User,
+                    text,
+                });
+                self.trim_chat();
+                self.follow_tail = true;
             }
             SessionUpdate::ToolCall { title, status } => {
+                if self.engolir_replay {
+                    return; // reconexão: a tela é o log; a linha não entra
+                }
                 self.chat.push(ChatItem {
                     author: Author::Info,
                     text: format!("ferramenta: {title} — {status}"),
@@ -777,6 +834,9 @@ impl App {
                 tool_call_id,
                 status,
             } => {
+                if self.engolir_replay {
+                    return; // reconexão: nada corrompe o texto do histórico
+                }
                 if let Some(item) = self
                     .chat
                     .iter_mut()
@@ -814,6 +874,7 @@ impl App {
                         self.info("Turno cancelado.".into());
                     }
                     self.status = Status::Idle;
+                    self.retry_used = false; // turno completo: reenvio automático armado de novo
                     if let Some(queued) = self.queued_voice.take() {
                         self.send_prompt(&queued, true);
                     }
@@ -824,10 +885,24 @@ impl App {
                         self.status = Status::Idle;
                     }
                     ErrorOutcome::SessionExpiredOrUnknown => {
-                        self.info("Sessão expirou ou não existe; abrindo outra…".into());
-                        self.retry_text = self.last_user_text();
-                        self.session_id = None;
-                        self.begin_new_session();
+                        if self.retry_used {
+                            // Já houve um reenvio automático nesta sequência e
+                            // o daemon recusou de novo: reenviar outra vez é
+                            // o loop de permanência (sessão nova + mesma mensagem
+                            // para sempre). Recupera a sessão, mas SEM reenviar.
+                            self.info(
+                                "A sessão expirou de novo; desisto do reenvio automático (a trava anti-loop só tenta uma vez). Rode com --new-session se persistir."
+                                    .into(),
+                            );
+                            self.session_id = None;
+                            self.begin_new_session();
+                        } else {
+                            self.retry_used = true;
+                            self.info("Sessão expirou ou não existe; abrindo outra…".into());
+                            self.retry_text = self.last_user_text();
+                            self.session_id = None;
+                            self.begin_new_session();
+                        }
                     }
                     ErrorOutcome::Other => {
                         self.info(format!("Erro do daemon: {}", e.message));
@@ -853,8 +928,32 @@ impl App {
         ));
     }
 
+    /// Recarga de sessão: arma o modo "histórico mudo". A PRIMEIRA carga da
+    /// execução limpa a tela para o replay reconstruir a sessão do zero;
+    /// depois disso toda carga é RECONEXÃO — o acesso é apenas um aviso e o
+    /// replay engolido é descartado, porque a tela (`chat`) é o log oficial
+    /// das mensagens e a conversa segue da última linha já exibida.
+    fn armar_replay(&mut self) {
+        self.historico_silencioso = true;
+        self.speech_buffer.clear();
+        if self.ja_carregou {
+            // Reconexão: a tela já mostra a sessão inteira; nada entra nela.
+            self.engolir_replay = true;
+            self.diag(
+                "reconexão: replay do histórico descartado (a tela já mostra a sessão inteira)"
+                    .into(),
+            );
+        } else {
+            // Primeira carga da execução: replay reconstrói a tela.
+            self.engolir_replay = false;
+            self.chat.clear();
+        }
+    }
+
     /// Após falha de load/resume (ou ausência de sessão salva): sessão nova.
     pub fn begin_new_session(&mut self) {
+        self.historico_silencioso = false; // sessão nova: não há histórico a esconder
+        self.engolir_replay = false;
         self.init_phase = Some(InitPhase::CreatingSession);
         self.session_phase = Some(InitPhase::CreatingSession);
         self.phase_started_at = Some(Instant::now());
@@ -921,6 +1020,11 @@ impl App {
                         self.init_phase = Some(InitPhase::Resuming);
                         self.session_phase = Some(InitPhase::Resuming);
                         self.phase_started_at = Some(Instant::now());
+                        // Regra da recarga: o daemon reenvia o histórico salvo
+                        // como session/update ANTES de responder. O cliente
+                        // reconstrói a tela com ele, mas NÃO fala e NÃO
+                        // interage com nada — histórico é só contexto.
+                        self.armar_replay();
                         self.diag(format!("sessão salva encontrada; tentando retomar ({sid})"));
                         let params = json!({ "sessionId": sid.clone() });
                         let load_err = self.acp.as_mut().and_then(|acp| {
@@ -971,10 +1075,34 @@ impl App {
                     return;
                 }
                 if phase == InitPhase::Resuming {
-                    self.info("Sessão anterior retomada.".into());
+                    let reconexao = self.ja_carregou;
+                    // Continua mudo: o daemon pode continuar expondo
+                    // histórico após a resposta. A fala volta só no próximo
+                    // prompt do usuário (send_prompt desarma a trava).
+                    self.historico_silencioso = true;
+                    self.engolir_replay = false; // replay terminou
+                    if self.retry_text.take().is_some() {
+                        self.diag(
+                            "mensagem pendente descartada na retomada: recarga não repete mensagem"
+                                .into(),
+                        );
+                    }
+                    if reconexao {
+                        self.info("Sessão anterior retomada; a tela segue de onde parou.".into());
+                    } else {
+                        self.info(
+                            "Sessão anterior retomada (histórico na tela, sem repetir falas)."
+                                .into(),
+                        );
+                    }
                 } else {
                     self.info("Sessão nova criada.".into());
+                    self.historico_silencioso = false;
+                    self.engolir_replay = false;
                 }
+                // O primeiro handshake completo desta execução marca o limite:
+                // qualquer session/load posterior é reconexão (replay engolido).
+                self.ja_carregou = true;
                 self.session_id = Some(sid.clone());
                 if let Some(state) = self.state.as_ref() {
                     if let Err(e) = state.save_session(&self.agent_alias, &sid) {

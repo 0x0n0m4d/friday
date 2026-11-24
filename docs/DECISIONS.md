@@ -97,9 +97,32 @@ a leitura, não depois.
 `sessionId` por apelido em `${XDG_STATE_HOME:-~/.local/state}/sexta-feira/sessao-<alias>.json`
 (0600, gravação atômica por renomeio). No boot: `session/load` e, em falha, `session/new` (VERIFY:
 os docs citam também `session/resume`). Expiração (erro de sessão desconhecida/expirada) → nova
-sessão + aviso + reenvio da última pergunta. Queda da conexão → `Disconnected` + recuo exponencial
+sessão + aviso + reenvio da última pergunta — no máximo UMA vez (trava anti-loop de 2026-11-23:
+quando o daemon recusou também o reenvio como "sessão expirada", o ciclo de recriar-a-sessão-e-
+reenviar virava loop infinito de repetições no chat; hoje o cliente desiste do reenvio automático
+e deixa a sessão nova pronta para o próximo envio manual). Queda da conexão → `Disconnected` + recuo exponencial
 limitado. Instância única por `flock` (`sexta-feira.lock`); segunda instância sai com código 3.
 `--new-session` apaga a sessão salva e começa nova.
+
+**Recarga (2026-11-23, regra definitiva):** ao retomar uma sessão salva, o daemon reenvia o histórico
+completo como `session/update` (chunks de usuário e de agente). A sexta-feira trata esse fluxo como
+**contexto puro**: reconstrói a tela com a sessão inteira e SÓ isso — não fala nada no Piper, não
+reenvia nenhuma mensagem, não existe opção de "repetir" histórico. Implementação: a partir do envio
+de `session/load` o cliente começa a descartar/reexibir a tela e arma `historico_silencioso`; a
+trava só se solta quando o USUÁRIO envia uma mensagem própria (`send_prompt`), e é aí que a voz
+volta. Motivação: antes disso, cada recarga/reconexão tocava a sessão inteira no Piper e parecia um
+loop de repetição sem fim. `user_message_chunk` (linhas do usuário no histórico) passou a ser exibido
+em `Author::User`, sem afeto colateral.
+
+**Reconexão (2026-11-23, regra definitiva):** a tela de conversa é um **log individual — um
+mostrador de mensagens**, não influenciado por nada além do próprio fluxo. O PRIMEIRO handshake
+de cada execução marca o limite (`ja_carregou`): qualquer `session/load` depois dele é RECONEXÃO.
+Na reconexão (queda em pleno uso e retomada automática), o replay completo que o daemon devolve
+(`agent_message_chunk`, `user_message_chunk`, `tool_call`/`tool_call_update`) é **engolido**
+(`engolir_replay`): nada entra na tela, nada fala, nada se duplica — a tela já é o log oficial da
+sessão, e a conversa segue da última mensagem exibida. O usuário é avisado ("a tela segue de onde
+parou") e a voz volta só no próximo prompt. Na abertura (primeira carga), a regra anterior vale:
+replay reconstrói a tela inteira, mudo e sem reenvio.
 
 ## D12. Logs
 

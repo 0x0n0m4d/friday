@@ -6,7 +6,11 @@
 //!   --permission                 pede session/request_permission no turno
 //!   --malformed                  envia uma mensagem quebrada após initialize
 //!   --load-bad                   session/load e session/resume respondem erro
+//!   --load-replay                antes de responder session/load, reenvia o
+//!                                histórico salvo como session/update (como
+//!                                faz o daemon real na recarga de sessão)
 //!   --prompt-unknown-session     o primeiro session/prompt falha como sessão expirada
+//!   --prompt-always-unknown-session   TODOS os session/prompt falham como sessão expirada
 //!   --exit-after-reply           encerra após a primeira resposta
 //!   --no-audio-cap               não anuncia capacidade de áudio
 //!   --session-id <id>            id de sessão (padrão "s-mock-1")
@@ -35,6 +39,8 @@ fn main() {
     let mut exit_after_reply = false;
     let mut audio_cap = true;
     let mut prompt_error_first = false;
+    let mut prompt_error_always = false;
+    let mut load_replay = false;
     let mut port: u16 = 0;
     let mut require_token: Option<String> = None;
     let mut args = std::env::args().skip(1);
@@ -55,6 +61,8 @@ fn main() {
             "--malformed" => malformed = true,
             "--load-bad" => load_ok = false,
             "--prompt-unknown-session" => prompt_error_first = true,
+            "--prompt-always-unknown-session" => prompt_error_always = true,
+            "--load-replay" => load_replay = true,
             "--exit-after-reply" => exit_after_reply = true,
             "--no-audio-cap" => audio_cap = false,
             "--session-id" => {
@@ -96,6 +104,8 @@ fn main() {
             exit_after_reply,
             audio_cap,
             prompt_error_first,
+            prompt_error_always,
+            load_replay,
             require_token.as_deref(),
         );
         if encerrar {
@@ -118,6 +128,8 @@ fn serve_connection(
     exit_after_reply: bool,
     audio_cap: bool,
     prompt_error_first: bool,
+    prompt_error_always: bool,
+    load_replay: bool,
     require_token: Option<&str>,
 ) -> bool {
     let mut sock = sock;
@@ -232,6 +244,33 @@ fn serve_connection(
                 }
                 "session/load" | "session/resume" => {
                     if load_ok {
+                        // Recarga realista: o daemon expele o histórico salvo
+                        // como session/update ANTES de responder ao load.
+                        if load_replay && method == "session/load" {
+                            let upd = |kind: &str, text: &str| {
+                                serde_json::json!({
+                                    "jsonrpc": "2.0", "method": "session/update",
+                                    "params": {"sessionId": session_id, "update": {
+                                        "sessionUpdate": kind,
+                                        "content": {"type": "text", "text": text}
+                                    }}
+                                })
+                            };
+                            let _ = ws::send_text_server(
+                                &mut sock,
+                                &upd(
+                                    "user_message_chunk",
+                                    "histórico: qual é a capital do Brasil?",
+                                )
+                                .to_string(),
+                            );
+                            std::thread::sleep(Duration::from_millis(10));
+                            let _ = ws::send_text_server(
+                                &mut sock,
+                                &upd("agent_message_chunk", "histórico: Brasília.").to_string(),
+                            );
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
                         result = serde_json::json!({ "sessionId": session_id});
                     } else {
                         error = Some(serde_json::json!({
@@ -241,7 +280,7 @@ fn serve_connection(
                 }
                 "session/prompt" => {
                     let nth = prompt_count.fetch_add(1, Ordering::SeqCst) + 1;
-                    if prompt_error_first && nth == 1 {
+                    if prompt_error_always || (prompt_error_first && nth == 1) {
                         error = Some(serde_json::json!({
                             "code": -32000,
                             "message": "sessão desconhecida (expirada)"
