@@ -25,61 +25,11 @@ pub struct Config {
     #[serde(default)]
     pub acp: Acp,
     #[serde(default)]
-    pub agent: Agent,
-    #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
     pub log: Log,
     #[serde(default)]
     pub paths: Paths,
-}
-
-/// Comportamento que a sexta-feira impõe ao turno, antes do prompt sair.
-#[derive(Deserialize, Debug, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct Agent {
-    /// Prefixa um lembrete curto a cada turno: o modelo deve invocar a
-    /// ferramenta de verdade em vez de responder com bash em blocos de
-    /// markdown (falha comum em modelos gratuitos; sem isso nenhum modal de
-    /// permissão aparece, porque nenhuma ferramenta foi pedida).
-    #[serde(default = "default_true")]
-    pub tool_reminder: bool,
-    /// Sobrepõe o texto do lembrete (uma linha; ver DEFAULT_TOOL_REMINDER).
-    #[serde(default)]
-    pub tool_reminder_text: Option<String>,
-}
-
-impl Default for Agent {
-    fn default() -> Self {
-        Agent {
-            tool_reminder: true,
-            tool_reminder_text: None,
-        }
-    }
-}
-
-/// Texto padrão do lembrete de `[agent].tool_reminder`.
-// Formato EXATO do protocolo prompt-guided do ZeroClaw v0.9.0
-// (zeroclaw-api/src/model_provider.rs, build_tool_instructions_text): o
-// modelo deve abrir a tag  com JSON {"name", "arguments"} e listar os
-// parâmetros como chave=valor — esse é o único dialeto que o parser
-// (zeroclaw-tool-call-parser) reconhece entre os textuais. Ensinamos
-// verbatim para o modelo não inventar dialetos como {"tool": ...} (visto
-// em campo com nemotron-3-ultra:free — parsed_tool_calls: 0).
-pub const DEFAULT_TOOL_REMINDER: &str = "Regra obrigatória: quando o pedido exigir uma ação real (criar, ler ou alterar arquivos, executar comandos, pesquisar etc.), abra a tag  com JSON exato {\"name\": \"nome_da_ferramenta\", \"arguments\": {\"param\": \"valor\"}} e escreva na linha seguinte cada parâmetro como chave=valor, fechando com a tag  — esse é o protocolo de tool calls; nunca responda com comandos em blocos de código e nunca simule o resultado de uma ação que não executou.";
-
-impl Agent {
-    /// Linha a prefixar no prompt (None = não prefixar nada).
-    pub fn reminder_line(&self) -> Option<&str> {
-        if !self.tool_reminder {
-            return None;
-        }
-        Some(
-            self.tool_reminder_text
-                .as_deref()
-                .unwrap_or(DEFAULT_TOOL_REMINDER),
-        )
-    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -718,49 +668,6 @@ url = "ws://127.0.0.1:42617/acp"
         cfg.acp.url = Some("wss://127.0.0.1:42617/acp".into());
         let errs = validate(&cfg).unwrap_err();
         assert!(errs.0.iter().any(|e| e.contains("wss://")));
-    }
-
-    #[test]
-    fn lembrete_de_ferramenta_ligado_por_padrao() {
-        let cfg: Config = toml::from_str(BASE).unwrap();
-        assert!(cfg.agent.tool_reminder);
-        assert_eq!(cfg.agent.reminder_line(), Some(DEFAULT_TOOL_REMINDER));
-    }
-
-    #[test]
-    fn lembrete_padrao_ensina_o_protocolo_exato_que_o_parser_aceita() {
-        // Em campo o modelo inventou o dialeto {"tool": ...} (parsed_tool_calls:
-        // 0). O lembrete padrão tem de ensinar VERBATIM o protocolo prompt-guided:
-        // a tag de abertura com JSON {"name","arguments"} e a de fechamento.
-        let abre = format!("{}{}{}", '<', "tool_call", '>');
-        let fecha = format!("{}{}{}", '<', "/tool_call", '>');
-        assert!(
-            DEFAULT_TOOL_REMINDER.contains(&abre),
-            "lembrete precisa abrir a tag do protocolo"
-        );
-        assert!(
-            DEFAULT_TOOL_REMINDER.contains(&fecha),
-            "lembrete precisa fechar a tag"
-        );
-        assert!(
-            DEFAULT_TOOL_REMINDER.contains("{\"name\": ")
-                && DEFAULT_TOOL_REMINDER.contains("{\"param\": \"valor\"}"),
-            "lembrete precisa mostrar o JSON do protocolo"
-        );
-        assert!(DEFAULT_TOOL_REMINDER.contains("chave=valor"));
-    }
-
-    #[test]
-    fn lembrete_de_ferramenta_desligado_e_texto_proprio() {
-        let com_agente = format!(
-            "{BASE}\n[agent]\ntool_reminder = false\ntool_reminder_text = \"use as tools\"\n"
-        );
-        let cfg: Config = toml::from_str(&com_agente).unwrap();
-        assert_eq!(cfg.agent.reminder_line(), None);
-        assert_eq!(
-            cfg.agent.tool_reminder_text.as_deref(),
-            Some("use as tools")
-        );
     }
 
     #[test]

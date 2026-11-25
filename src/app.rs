@@ -442,19 +442,6 @@ impl App {
         // O usuário está falando de novo: o que chegar daqui por diante é
         // resposta viva, não histórico (recarga de sessão volta a falar).
         self.historico_silencioso = false;
-        // Contorno para modelos que respondem com bash em markdown em vez de
-        // chamar ferramentas: o lembrete ([agent].tool_reminder) vira a
-        // primeira linha do payload, mas não aparece no chat nem no reenvio
-        // (que guarda o texto do usuário e passa por aqui de novo).
-        let payload = match self.cfg.agent.reminder_line() {
-            Some(reminder) => format!("{reminder}\n\n{sanitized}"),
-            None => sanitized.clone(),
-        };
-        if payload != sanitized {
-            self.diag(
-                "[agent] lembrete de tool call anexado ao prompt ([agent].tool_reminder)".into(),
-            );
-        }
         let Some(session_id) = self.session_id.clone() else {
             self.retry_text = Some(sanitized);
             self.diag(
@@ -481,7 +468,7 @@ impl App {
         };
         match acp.send_request(
             "session/prompt",
-            json!({ "sessionId": session_id, "prompt": payload }),
+            json!({ "sessionId": session_id, "prompt": sanitized.clone() }),
         ) {
             Ok(id) => {
                 self.pending_prompt = Some(id);

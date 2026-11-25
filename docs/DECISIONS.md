@@ -187,37 +187,44 @@ proibido continua proibido (D12): nenhum prompt, transcrição, texto do modelo 
 
 ---
 
-## D14. Lembrete de tool call por turno (`[agent].tool_reminder`)
+## D14. Chamada de ferramentas — REMOVIDO o lembrete de turno (revoga o D14 original)
 
-**Problema observado em campo (2026-11-23):** com `nvidia/nemotron-3-ultra-550b-a55b:free`, o agente
-respondia "File created successfully" dentro de blocos bash/text em markdown, no texto puro. O
-runtime-trace do daemon mostrava `native_tool_calls: 0`, `parsed_tool_calls: 0` — nenhuma ferramenta
-foi pedida, logo nenhum `session/request_permission` pôde disparar. O parser do ZeroClaw
-(`zeroclaw-tool-call-parser`) só reconhece `<tool_call>` XML e formato JSON de tool call; blocos
-markdown de bash NÃO são parseados nem descartados. Não é um bug de permissão nem da sexta-feira.
+**Histórico:** o D14 original (2026-11-23) criou `[agent].tool_reminder` — um prefixo de regra por
+turno que ensinava ao modelo o dialeto textual (etiqueta tool_call com JSON de "name" e
+"arguments", parâmetros como chave=valor) para contornar modelos gratuitos que respondiam bash em
+markdown (`parsed_tool_calls: 0`).
 
-**Evidências consultadas em 2026-11-23:**
+**Revogação (2026-11-25):** com a engenharia reversa do ZeroClaw v0.9.0, a abordagem foi rejeitada
+pelo dono do projeto:
 
-- API da OpenRouter (`/api/v1/models/<id>/endpoints`): o modelo usado declara `tools` e
-  `tool_choice` em `supported_parameters` — ou seja, a capacidade EXISTE, mas o modelo a ignora na
-  prática (comportamento típico de modelos gratuitos).
-- Docs do ZeroClaw (docs.zeroclaw.com, ex-wiki 05.1/05.4 e PR #11740): providers com
-  `native_tool_calling` (openai, anthropic, openrouter, gemini) mandam tool specs nativas; providers
-  `custom` caem no modo prompt-guided POR PADRÃO a menos que `native_tools = true`.
+- `agent.rs` (dispatcher): o `tool_dispatcher` do runtime profile decide o modo em conjunto com a
+  capacidade do provider. Dispatcher `native` envia as `tools` no corpo da requisição HTTP e espera
+  `tool_calls` estruturados de volta; o modo texto/xml escreve as instruções de protocolo no system prompt
+  (via bloco de protocolo que o cliente NÃO deve reimplementar) e depende de parser textual.
+- Enviar lembrete textual pelo cliente é duplicar (de forma pior) o que o modo xml já faz, e não
+  resolve modelos `:free` que declaram `tools` mas não respeitam nativamente.
+- Princípio do dono: "A ideia não é utilizar conteúdos externos para testar funcionalidades
+  internas. O próprio código precisa se resolver." O lembrete era exatamente isso (conteúdo externo
+  injetado no prompt).
 
-**Decisão:** contorno no lado do cliente, como parte do payload — `[agent].tool_reminder` (padrão
-ligado) prefixa uma regra curta e fixa a cada turno ordenando o uso do protocolo de ferramentas e
-proibindo simular resultados. Motivos:
+**Decisão:** REMOVIDO por completo do lado do cliente — nada de `[agent].tool_reminder`,
+`tool_reminder_text`, `DEFAULT_TOOL_REMINDER` nem anexo de payload em `send_prompt`; o prompt do
+usuário vai intacto ao daemon. O campo de fluxo correto é o daemon:
 
-- resolve para QUALQUER provider/modelo escolhido pelo usuário, inclusive grátis; não exige rebuild
-  do daemon nem trocar de modelo imediatamente;
-- o lembrete é configurável (`tool_reminder_text`) e desligável (`tool_reminder = false`) — quando o
-  usuário passar para um modelo que respeita tool calls, pode economizar os tokens;
-- o texto do usuário continua intacto no chat, no reenvio pós-reconexão e no limite
-  `prompt_max_chars` — o lembrete é acrescentado só imediatamente antes do envio.
+```toml
+[runtime_profiles.perfil-do-sextafeira]
+tool_dispatcher = "native"
+```
 
-Limitação assumida: é um empurrão, não uma garantia — modelo insuficiente pode continuar errando o
-formato; caminho de fundo é trocar de modelo ou ajustar o provider no lado do ZeroClaw.
+Verificação: `tools_count` maior que zero e `native_tool_calls` 1 ou mais no
+`~/.zeroclaw/data/state/runtime-trace.jsonl`; modal de permissão aparece na sexta-feira. Se o modelo
+`:free` não devolve tool calls nativos, a solução é trocar de modelo — não voltou ao lembrete.
+
+**Migração:** quem tinha `[agent]` no `~/.config/friday/config.toml` deve REMOVER a seção inteira
+(a config agora rejeita chaves desconhecidas e a carga falha com erro apontando para a linha).
+
+**Notas de manutenção:** os testes `lembrete_*` foram removidos; o repo não contém mais referência
+a lembretes de ferramenta.
 
 ---
 

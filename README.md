@@ -140,17 +140,6 @@ handshake_timeout_secs = 10
 prompt_max_chars = 8000
 esc_cancels = true          # Esc cancela o turno em andamento
 
-# ---- comportamento do agente --------------------------------------
-[agent]
-# Modelos gratuitos (e alguns locais) às vezes respondem com comandos bash em
-# blocos de markdown em vez de chamar ferramentas de verdade — aí nenhum
-# modal de permissão aparece, porque nenhuma ferramenta foi pedida (no
-# runtime-trace do daemon: parsed_tool_calls: 0). Este lembrete vai prefixado
-# a CADA turno para impor o comportamento. Desligue depois de trocar para um
-# modelo que respeita tool calls, se quiser economizar tokens.
-tool_reminder = true
-# tool_reminder_text = "..."   # sobrepõe o texto padrão do lembrete (uma linha)
-
 # ---- limites e logs ------------------------------------------------
 [limits]
 reconnect_backoff_min_ms = 1000   # reconexão após queda da conexão
@@ -186,30 +175,45 @@ fallback_key = "f8"   # F8 liga e desliga a escuta
 
 O restante do fluxo (gravar → transcrever → enviar → falar) é idêntico.
 
-### 4.2 Lembrete de ferramenta (`[agent]`)
+### 4.2 Chamada de ferramentas (tudo no lado do daemon)
 
-O modal de permissão só aparece quando o modelo emite uma **tool call de verdade** que o ZeroClaw
-reconhece (formato `<tool_call>` XML ou JSON de tool call). Se o modelo responde com um bloco de código bash em markdown fingindo que executou, o ZeroClaw não tem nada para aprovar: `parsed_tool_calls: 0`
-e nada acontece. A API da OpenRouter confirma que muitos modelos `:free` **declaram** suporte a
-`tools` (verifique em `openrouter.ai/api/v1/models/<id>/endpoints`: `supported_parameters` deve conter
-`tools`), mas mesmo assim erram o formato na prática — o lembrete por turno existe exatamente para
-empurrar esses modelos para o caminho certo.
+O modal de permissão só aparece quando o modelo emite uma **tool call de verdade** — uma resposta
+estruturada que o ZeroClaw reconhece. O comportamento correto NÃO é instruir o modelo via texto do
+prompt (a sexta-feira NÃO prefixa nada no seu prompt: seu texto vai intacto); é o provider
+entregar as especificações de ferramenta na API e o modelo RETORNAR a chamada estruturada — a
+funcionalidade interna é retornada nativamente, não impressa em texto.
 
-- `tool_reminder = true` (padrão): cada prompt sai prefixado com uma linha de regra (ver
-  `DEFAULT_TOOL_REMINDER` em `src/config.rs`). O texto padrão ensina o **protocolo exato** que o
-  ZeroClaw entende no modo prompt-guided: `⌘tool_call⌘` com JSON `{"name": …, "arguments": {…}}` e os
-  parâmetros como `chave=valor`. Modelos gratuitos inventam dialetos (ex.: `{"tool": …}` — que o
-  parser NÃO reconhece); o lembrete é o antídoto. O lembrete NÃO aparece no chat nem conta para o
-  reenvio — só vai no payload para o daemon.
-- `tool_reminder_text`: troque para usar a sua própria instrução (por exemplo em inglês, se o seu
-  agente opera em inglês).
-- `tool_reminder = false`: desliga (recomendado só para modelos que já chamam ferramentas bem).
+No ZeroClaw v0.9.0 isso é controlado pelo `tool_dispatcher` do **runtime profile** do agente, no
+`~/.zeroclaw/config.toml` do daemon:
 
-Complementos no lado do **ZeroClaw** (sem rebuild da sexta-feira): um provider `custom` cai no modo
-prompt-guided por padrão — se o endpoint é compatível com OpenAI e aceita `tools`, ponha
-`native_tools = true` no provider para usar chamadas nativas; e/ou reforce a persona do agente com a
-mesma regra. Trocar para um modelo gratuito que responde bem a tool calls (procure
-`supported_parameters=tools` na OpenRouter) reduz a dependência do lembrete.
+```toml
+[runtime_profiles.perfil-do-agente]
+tool_dispatcher = "native"
+```
+
+- `"native"`: as specs de ferramenta vão no campo `tools` da requisição ao provider e a resposta
+  volta com tool calls estruturados na mensagem — sem parser de texto, sem dialeto inventado, sem
+  lembrete. É o caminho principal.
+- `"xml"` (o modo texto): as ferramentas são descritas no system prompt e a resposta volta como
+  TEXTO, que um parser textual tenta decodificar; nenhum dialeto reconhecido significa
+  `parsed_tool_calls: 0` e o texto vira a resposta final — o sintoma observado (o agente "printa o
+  que deveria executar, sem resposta"). Esse modo depende de etiquetas com sinais de menor e maior
+  em texto, que nem sempre sobrevivem ao transporte.
+
+Obs.: a dica antiga de por `native_tools = true` no **provider** está desatualizada para v0.9.0 — o
+ajuste que vale é o `tool_dispatcher` no **runtime profile** acima.
+
+**Como conferir na prática** (reinicie o daemon primeiro):
+
+```bash
+tail -f ~/.zeroclaw/data/state/runtime-trace.jsonl | python3 -m json.tool --json-lines
+```
+
+Com `tool_dispatcher = "native"` funcionando: `tools_count` maior que zero, `native_tool_calls` 1 ou
+mais e o modal de permissão aparece na sexta-feira. Se `native_tool_calls` segue em 0 com um modelo
+`:free`, o modelo declara suporte a `tools` mas não respeita na prática — a solução de fundo é
+trocar de modelo (procure `supported_parameters=tools` na OpenRouter, com function calling real),
+nunca colocar contornos no cliente.
 
 ### 4.3 Recarga e reconexão de sessão (o que acontece ao abrir de novo)
 
