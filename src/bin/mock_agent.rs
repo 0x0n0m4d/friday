@@ -271,7 +271,10 @@ fn serve_connection(
                             );
                             std::thread::sleep(Duration::from_millis(10));
                         }
-                        result = serde_json::json!({ "sessionId": session_id});
+                        // Realismo ZeroClaw 0.9.0: session/load responde {}
+                        // (SEM sessionId — o id é o que o cliente pediu; ver
+                        // docs/DECISIONS.md D11). O cliente usa pending_load_sid.
+                        result = serde_json::json!({});
                     } else {
                         error = Some(serde_json::json!({
                             "code": -32000, "message": "sessão desconhecida"

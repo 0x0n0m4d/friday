@@ -59,7 +59,14 @@ impl Default for Agent {
 }
 
 /// Texto padrão do lembrete de `[agent].tool_reminder`.
-pub const DEFAULT_TOOL_REMINDER: &str = "Regra obrigatória: quando o pedido exigir uma ação real (criar, ler ou alterar arquivos, executar comandos, pesquisar etc.), invoque a ferramenta apropriada pelo protocolo de tool calls do ZeroClaw em vez de responder com comandos em blocos de código; nunca simule o resultado de uma ação que não executou.";
+// Formato EXATO do protocolo prompt-guided do ZeroClaw v0.9.0
+// (zeroclaw-api/src/model_provider.rs, build_tool_instructions_text): o
+// modelo deve abrir a tag  com JSON {"name", "arguments"} e listar os
+// parâmetros como chave=valor — esse é o único dialeto que o parser
+// (zeroclaw-tool-call-parser) reconhece entre os textuais. Ensinamos
+// verbatim para o modelo não inventar dialetos como {"tool": ...} (visto
+// em campo com nemotron-3-ultra:free — parsed_tool_calls: 0).
+pub const DEFAULT_TOOL_REMINDER: &str = "Regra obrigatória: quando o pedido exigir uma ação real (criar, ler ou alterar arquivos, executar comandos, pesquisar etc.), abra a tag  com JSON exato {\"name\": \"nome_da_ferramenta\", \"arguments\": {\"param\": \"valor\"}} e escreva na linha seguinte cada parâmetro como chave=valor, fechando com a tag  — esse é o protocolo de tool calls; nunca responda com comandos em blocos de código e nunca simule o resultado de uma ação que não executou.";
 
 impl Agent {
     /// Linha a prefixar no prompt (None = não prefixar nada).
@@ -718,6 +725,29 @@ url = "ws://127.0.0.1:42617/acp"
         let cfg: Config = toml::from_str(BASE).unwrap();
         assert!(cfg.agent.tool_reminder);
         assert_eq!(cfg.agent.reminder_line(), Some(DEFAULT_TOOL_REMINDER));
+    }
+
+    #[test]
+    fn lembrete_padrao_ensina_o_protocolo_exato_que_o_parser_aceita() {
+        // Em campo o modelo inventou o dialeto {"tool": ...} (parsed_tool_calls:
+        // 0). O lembrete padrão tem de ensinar VERBATIM o protocolo prompt-guided:
+        // a tag de abertura com JSON {"name","arguments"} e a de fechamento.
+        let abre = format!("{}{}{}", '<', "tool_call", '>');
+        let fecha = format!("{}{}{}", '<', "/tool_call", '>');
+        assert!(
+            DEFAULT_TOOL_REMINDER.contains(&abre),
+            "lembrete precisa abrir a tag do protocolo"
+        );
+        assert!(
+            DEFAULT_TOOL_REMINDER.contains(&fecha),
+            "lembrete precisa fechar a tag"
+        );
+        assert!(
+            DEFAULT_TOOL_REMINDER.contains("{\"name\": ")
+                && DEFAULT_TOOL_REMINDER.contains("{\"param\": \"valor\"}"),
+            "lembrete precisa mostrar o JSON do protocolo"
+        );
+        assert!(DEFAULT_TOOL_REMINDER.contains("chave=valor"));
     }
 
     #[test]

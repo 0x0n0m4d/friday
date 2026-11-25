@@ -116,6 +116,11 @@ pub struct App {
     /// Sem Piper, sem reenvio, sem interação. Desliga somente quando o usuário
     /// manda uma mensagem própria — aí os próximos chunks voltam a ser falados.
     pub historico_silencioso: bool,
+    /// `sessionId` que o cliente PEDIU no session/load em curso. O ZeroClaw
+    /// 0.9.0 responde a carga com `{}` (SEM sessionId — o id da sessão é o
+    /// mesmo que foi pedido; ver docs/DECISIONS.md D11), então guardamos aqui
+    /// para também tratá-lo como localizado na resposta do handshake.
+    pub pending_load_sid: Option<String>,
     /// Verdadeiro depois do PRIMEIRO handshake completo desta execução. Nova
     /// carga de sessão depois disso é RECONEXÃO — e reconexão não toca na
     /// tela: o chat é o log oficial das mensagens, e o replay do daemon sai
@@ -169,6 +174,7 @@ impl App {
             reconnect_attempt: 0,
             reconnect_at: None,
             retry_text: None,
+            pending_load_sid: None,
             retry_used: false,
             historico_silencioso: false,
             ja_carregou: false,
@@ -380,6 +386,7 @@ impl App {
         self.phase_started_at = None;
         self.historico_silencioso = false;
         self.engolir_replay = false;
+        self.pending_load_sid = None;
         self.speech_buffer.clear();
         let base = self.cfg.limits.reconnect_backoff_min_ms;
         let max = self.cfg.limits.reconnect_backoff_max_ms;
@@ -1026,6 +1033,9 @@ impl App {
                         // interage com nada — histórico é só contexto.
                         self.armar_replay();
                         self.diag(format!("sessão salva encontrada; tentando retomar ({sid})"));
+                        // ZeroClaw 0.9.0 responde session/load com {} (sem
+                        // sessionId): o id é o que estamos pedindo agora.
+                        self.pending_load_sid = Some(sid.clone());
                         let params = json!({ "sessionId": sid.clone() });
                         let load_err = self.acp.as_mut().and_then(|acp| {
                             // VERIFY: os docs citam session/load e session/resume;
@@ -1065,11 +1075,22 @@ impl App {
     fn on_session_response(&mut self, _id: u64, result: Result<Value, RpcError>, phase: InitPhase) {
         match result {
             Ok(v) => {
-                let sid = v
+                let respondido = v
                     .get("sessionId")
                     .and_then(|s| s.as_str())
                     .unwrap_or("")
                     .to_string();
+                // ZeroClaw 0.9.0: session/load responde {} (sem sessionId —
+                // o id é o mesmo que o cliente pediu; `session/new` sim
+                // devolve sessionId). O id pedido fica em pending_load_sid.
+                let sid = if !respondido.is_empty() {
+                    respondido
+                } else if phase == InitPhase::Resuming {
+                    self.pending_load_sid.take().unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                self.pending_load_sid = None;
                 if sid.is_empty() {
                     self.connection_lost("resposta de sessão sem sessionId");
                     return;

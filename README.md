@@ -196,7 +196,10 @@ e nada acontece. A API da OpenRouter confirma que muitos modelos `:free` **decla
 empurrar esses modelos para o caminho certo.
 
 - `tool_reminder = true` (padrão): cada prompt sai prefixado com uma linha de regra (ver
-  `DEFAULT_TOOL_REMINDER` em `src/config.rs`). O lembrete NÃO aparece no chat nem conta para o
+  `DEFAULT_TOOL_REMINDER` em `src/config.rs`). O texto padrão ensina o **protocolo exato** que o
+  ZeroClaw entende no modo prompt-guided: `⌘tool_call⌘` com JSON `{"name": …, "arguments": {…}}` e os
+  parâmetros como `chave=valor`. Modelos gratuitos inventam dialetos (ex.: `{"tool": …}` — que o
+  parser NÃO reconhece); o lembrete é o antídoto. O lembrete NÃO aparece no chat nem conta para o
   reenvio — só vai no payload para o daemon.
 - `tool_reminder_text`: troque para usar a sua própria instrução (por exemplo em inglês, se o seu
   agente opera em inglês).
