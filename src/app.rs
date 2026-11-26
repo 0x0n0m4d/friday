@@ -442,6 +442,9 @@ impl App {
         // O usuário está falando de novo: o que chegar daqui por diante é
         // resposta viva, não histórico (recarga de sessão volta a falar).
         self.historico_silencioso = false;
+        // Sem lembretes injetados no payload: a chamada de ferramentas é
+        // papel do daemon (prompt/protocolo do ZeroClaw), não nosso.
+        let payload = sanitized.clone();
         let Some(session_id) = self.session_id.clone() else {
             self.retry_text = Some(sanitized);
             self.diag(
@@ -468,7 +471,7 @@ impl App {
         };
         match acp.send_request(
             "session/prompt",
-            json!({ "sessionId": session_id, "prompt": sanitized.clone() }),
+            json!({ "sessionId": session_id, "prompt": payload }),
         ) {
             Ok(id) => {
                 self.pending_prompt = Some(id);
@@ -707,6 +710,15 @@ impl App {
         while let Some(pos) = find_sentence_end(&self.speech_buffer) {
             let sentence: String = self.speech_buffer.drain(..=pos).collect();
             self.enqueue_speech(&sentence);
+        }
+        // Modelo escrevendo corrido sem pontuação à vista: não segura a voz
+        // até o fim do turno — corta no último espaço e fala desde já. O
+        // daemon faz streaming; a voz precisa acompanhar o mesmo ritmo.
+        if self.speech_buffer.chars().count() >= FALA_PARCIAL_CHARS {
+            if let Some(pos) = self.speech_buffer.rfind(' ') {
+                let parte: String = self.speech_buffer.drain(..=pos).collect();
+                self.enqueue_speech(&parte);
+            }
         }
     }
 
@@ -1335,6 +1347,11 @@ fn run_stt(
     .map(|t| stt::strip_silence_markers(&t, &whisper.silence_markers).unwrap_or_default())
     .map(|t| sanitize::cap_chars(&t, whisper.max_chars))
 }
+
+/// Texto sem pontuação acumulado acima disso vira fala parcial (corte no
+/// último espaço): com o Piper, pontuação pode demorar o turno inteiro a
+/// aparecer e a voz ficaria muda até lá.
+const FALA_PARCIAL_CHARS: usize = 240;
 
 /// Procura o fim de sentença dentro do buffer; devolve o índice (em bytes).
 fn find_sentence_end(buffer: &str) -> Option<usize> {

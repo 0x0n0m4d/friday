@@ -2,14 +2,15 @@
 //! toca com o Piper nativo + um reprodutor configurado. Falhas nunca são
 //! silenciosas: aparecem na barra de status (sem nunca falar o texto).
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -38,12 +39,7 @@ pub enum TtsEvent {
     Interrupted,
 }
 
-enum SpeakerCommand {
-    Speak(String),
-    Interrupt,
-    Shutdown,
-}
-
+#[derive(Clone)]
 pub struct SpeakerConfig {
     pub piper_command: Vec<String>,
     /// "stdout": WAV na saída padrão do piper; "file": piper grava em {file}.
@@ -192,30 +188,87 @@ fn split_sentences(text: &str) -> Vec<String> {
     sentences.into_iter().filter(|s| !s.is_empty()).collect()
 }
 
-// ---------- fio do falante ----------
+// ---------- fio do falante (pipeline em três partes) ----------
+
+/// Tamanho mínimo (em caracteres) do fragmento que vai ao Piper. Frases
+/// curtas (listas, saudações) são unidas ao que vier depois: cada fragmento
+/// é um spawn de processo e cada silêncio entre spawns é audível — fragmento
+/// miúdo demais soa exatamente como o "trava no meio da frase" relatado.
+pub const FRAG_MINIMO_CHARS: usize = 120;
+
+/// Espera ao reprocessar a fila quando o canal de síntese está cheio. Curto
+/// de propósito: Interrupt entre um fragmento e outro não pode esperar uma
+/// síntese inteira para ser atendido.
+const RELOGIO_FILA: Duration = Duration::from_millis(15);
+
+enum SpeakerCommand {
+    Speak(String),
+    Interrupt,
+    Shutdown,
+}
+
+/// Tarefa de síntese (texto → WAV). O `epoch` marca a rodada de fala: quando
+/// um Interrupt chega, a rodada cresce e tudo que carrega rodada antiga vira
+/// lixo imediato — sem flag booleana de cancelamento que precisa ser zerada
+/// na mão (a fonte de corridas da versão antiga).
+struct SynthTask {
+    epoch: u64,
+    sentence: String,
+}
+
+/// Tarefa de reprodução (WAV → som). Um único fio reproduz, então a ordem do
+/// canal é a ordem do som — nenhuma frase fala fora de vez.
+struct PlayTask {
+    epoch: u64,
+    fragment: Fragment,
+}
 
 pub struct Speaker {
     tx: Mutex<std::sync::mpsc::Sender<SpeakerCommand>>,
-    cancel: Arc<AtomicBool>,
 }
 
 impl Speaker {
+    /// Dá vida ao pipeline:
+    ///
+    ///   fila (ordem) ──► piper-synth ──canal(2)──► voz-player
+    ///   speak/queue      liga o Piper e     WAV       liga o player e
+    ///                    coleta o WAV                 reproduz
+    ///
+    /// Síntese e reprodução correm em paralelo: enquanto uma frase toca, a
+    /// próxima já está sendo sintetizada. Os canais acotados limitam a
+    /// antecipação a 2 frases na síntese e 2 áudios na fila de reprodução —
+    /// memória teto de 2 áudios, nunca o turno inteiro.
     pub fn new(cfg: SpeakerConfig, events: Sender<TtsEvent>) -> Speaker {
         let (tx, rx) = std::sync::mpsc::channel::<SpeakerCommand>();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_thread = cancel.clone();
-        let _ = std::thread::Builder::new()
-            .name("speaker".into())
-            .spawn(move || {
-                speaker_loop(cfg, rx, events, cancel_thread);
-            });
-        Speaker {
-            tx: Mutex::new(tx),
-            cancel,
+        let epoch = Arc::new(AtomicU64::new(0));
+        let (synth_tx, synth_rx) = std::sync::mpsc::sync_channel::<SynthTask>(2);
+        let (play_tx, play_rx) = std::sync::mpsc::sync_channel::<PlayTask>(2);
+
+        {
+            let cfg = cfg.clone();
+            let epoch = epoch.clone();
+            let events_synth = events.clone();
+            let _ = std::thread::Builder::new()
+                .name("piper-synth".into())
+                .spawn(move || synth_loop(cfg, synth_rx, play_tx, events_synth, epoch));
         }
+        {
+            let epoch = epoch.clone();
+            let events_play = events.clone();
+            let _ = std::thread::Builder::new()
+                .name("voz-player".into())
+                .spawn(move || play_loop(cfg, play_rx, events_play, epoch));
+        }
+        {
+            let epoch = epoch.clone();
+            let _ = std::thread::Builder::new()
+                .name("speaker".into())
+                .spawn(move || speaker_loop(rx, synth_tx, events, epoch));
+        }
+        Speaker { tx: Mutex::new(tx) }
     }
 
-    /// Enfileira uma frase; a ordem é preservada.
+    /// Enfileira uma frase; a ordem é preservada (uma fila de reprodução só).
     pub fn speak(&self, sentence: String) {
         if let Ok(tx) = self.tx.lock() {
             let _ = tx.send(SpeakerCommand::Speak(sentence));
@@ -223,8 +276,9 @@ impl Speaker {
     }
 
     /// Interrompe imediatamente o que está sendo falado e esvazia a fila.
+    /// A rodada cresce: síntese e reprodução descartam tudo que era da
+    /// rodada anterior, mesmo com processos ainda em pleno voo.
     pub fn interrupt(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
         if let Ok(tx) = self.tx.lock() {
             let _ = tx.send(SpeakerCommand::Interrupt);
         }
@@ -237,63 +291,164 @@ impl Speaker {
     }
 }
 
-fn speaker_loop(
-    cfg: SpeakerConfig,
-    rx: std::sync::mpsc::Receiver<SpeakerCommand>,
-    events: Sender<TtsEvent>,
-    cancel: Arc<AtomicBool>,
-) {
-    let mut queue: Vec<String> = Vec::new();
-    'main: loop {
-        match rx.recv() {
-            Ok(SpeakerCommand::Shutdown) => break,
+/// Processa comandos pendentes sem bloquear; devolve `false` quando o fio
+/// da fila deve sair. Chamado em dois pontos do ciclo — Interrupt nunca fica
+/// preso atrás de canal de síntese cheio.
+fn comandos_pendentes(
+    rx: &std::sync::mpsc::Receiver<SpeakerCommand>,
+    queue: &mut VecDeque<String>,
+    epoch: &AtomicU64,
+    events: &Sender<TtsEvent>,
+) -> bool {
+    loop {
+        match rx.try_recv() {
+            Ok(SpeakerCommand::Shutdown) => return false,
             Ok(SpeakerCommand::Interrupt) => {
+                epoch.fetch_add(1, Ordering::SeqCst);
                 queue.clear();
                 let _ = events.send(TtsEvent::Interrupted);
-                cancel.store(false, Ordering::SeqCst);
             }
-            Ok(SpeakerCommand::Speak(s)) => queue.push(s),
-            Err(_) => break,
-        }
-        while let Some(sentence) = queue.first().cloned() {
-            if cancel.load(Ordering::SeqCst) {
-                cancel.store(false, Ordering::SeqCst);
-                queue.clear();
-                let _ = events.send(TtsEvent::Interrupted);
-                continue 'main;
-            }
-            let _ = events.send(TtsEvent::Started);
-            match render_and_play(&cfg, &sentence, &cancel) {
-                Ok(()) => {
-                    let _ = events.send(TtsEvent::Finished(Ok(())));
-                }
-                Err(e) if e.is_interrupted() => {
-                    queue.clear();
-                    let _ = events.send(TtsEvent::Interrupted);
-                    continue 'main;
-                }
-                Err(e) => {
-                    let _ = events.send(TtsEvent::Finished(Err(e)));
-                }
-            }
-            queue.remove(0);
+            Ok(SpeakerCommand::Speak(s)) => queue.push_back(s),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
         }
     }
 }
 
-fn render_and_play(
-    cfg: &SpeakerConfig,
-    sentence: &str,
-    cancel: &Arc<AtomicBool>,
-) -> Result<(), TtsError> {
-    if cfg.piper_command.is_empty() {
-        return Err(TtsError("comando do piper não configurado".into()));
+/// Tira da fila o próximo pedaço de fala, unindo frases curtas até alcançar
+/// o tamanho mínimo. Ordem sempre: nada sai da frente de outra frase.
+fn proximo_fragmento(queue: &mut VecDeque<String>) -> Option<String> {
+    let primeiro = queue.pop_front()?;
+    if primeiro.chars().count() >= FRAG_MINIMO_CHARS {
+        return Some(primeiro);
     }
-    if cfg.player_command.is_empty() {
-        return Err(TtsError("comando do reprodutor não configurado".into()));
+    let mut juntado = primeiro;
+    while juntado.chars().count() < FRAG_MINIMO_CHARS {
+        let Some(proximo) = queue.pop_front() else {
+            break;
+        };
+        juntado.push(' ');
+        juntado.push_str(&proximo);
     }
-    let fragment = render_fragment(cfg, sentence, cancel)?;
-    play_fragment(cfg, fragment, cancel)
+    Some(juntado)
+}
+
+/// Fio da fila: recebe Speak/Interrupt/Shutdown e alimenta a síntese. Nunca
+/// faz rendição de áudio nem conhece o Piper — só ordena.
+fn speaker_loop(
+    rx: std::sync::mpsc::Receiver<SpeakerCommand>,
+    synth_tx: SyncSender<SynthTask>,
+    events: Sender<TtsEvent>,
+    epoch: Arc<AtomicU64>,
+) {
+    let mut queue: VecDeque<String> = VecDeque::new();
+    'main: loop {
+        match rx.recv() {
+            Ok(SpeakerCommand::Shutdown) => break,
+            Ok(SpeakerCommand::Interrupt) => {
+                epoch.fetch_add(1, Ordering::SeqCst);
+                queue.clear();
+                let _ = events.send(TtsEvent::Interrupted);
+            }
+            Ok(SpeakerCommand::Speak(s)) => queue.push_back(s),
+            Err(_) => break,
+        }
+        if !comandos_pendentes(&rx, &mut queue, &epoch, &events) {
+            break 'main;
+        }
+        // Alimenta a síntese com a fila inteira; o canal acotado (2) manda o
+        // ritmo e mantém o fio de comandos continuamente atendido.
+        while !queue.is_empty() {
+            if !comandos_pendentes(&rx, &mut queue, &epoch, &events) {
+                break 'main;
+            }
+            let Some(sentence) = proximo_fragmento(&mut queue) else {
+                break;
+            };
+            let task = SynthTask {
+                epoch: epoch.load(Ordering::SeqCst),
+                sentence,
+            };
+            match synth_tx.try_send(task) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(devolvida)) => {
+                    queue.push_front(devolvida.sentence);
+                    // Síntese adiantada ao máximo: volta ao ciclo de comandos.
+                    std::thread::sleep(RELOGIO_FILA);
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break 'main,
+            }
+        }
+    }
+}
+
+/// Fio de síntese: um Piper por fragmento, mas SEM esperar ninguém ouvir —
+/// ele corre à frente do player. Rodada antiga ou falha: fragmento pulado,
+/// pipeline vivo (falha nunca silenciosa: vira evento de erro).
+fn synth_loop(
+    cfg: SpeakerConfig,
+    rx: std::sync::mpsc::Receiver<SynthTask>,
+    play_tx: SyncSender<PlayTask>,
+    events: Sender<TtsEvent>,
+    epoch: Arc<AtomicU64>,
+) {
+    for task in rx {
+        if task.epoch != epoch.load(Ordering::SeqCst) {
+            continue; // rodada antiga (Interrupt): nem liga o Piper
+        }
+        match render_fragment(&cfg, &task.sentence, task.epoch, &epoch) {
+            Ok(fragment) => {
+                // Bloqueia até o player ter lugar: é a válvula de backpressão.
+                // Se a rodada girar, o player descarta o áudio adiante.
+                let play = PlayTask {
+                    epoch: task.epoch,
+                    fragment,
+                };
+                if play_tx.send(play).is_err() {
+                    break; // fio de reprodução morreu: encerra a síntese
+                }
+            }
+            Err(e) => {
+                if task.epoch != epoch.load(Ordering::SeqCst) {
+                    continue; // interrompido no meio do voo: já foi anunciado
+                }
+                let _ = events.send(TtsEvent::Finished(Err(e)));
+            }
+        }
+    }
+}
+
+/// Fio de reprodução: consome os WAVs prontos em ordem; anuncia Started
+/// quando o som de verdade começa, não quando a síntese apenas começou.
+fn play_loop(
+    cfg: SpeakerConfig,
+    rx: std::sync::mpsc::Receiver<PlayTask>,
+    events: Sender<TtsEvent>,
+    epoch: Arc<AtomicU64>,
+) {
+    for task in rx {
+        let rodada = task.epoch;
+        if rodada != epoch.load(Ordering::SeqCst) {
+            continue; // rodada antiga: lixo de fila, descarta em silêncio
+        }
+        let _ = events.send(TtsEvent::Started);
+        if rodada != epoch.load(Ordering::SeqCst) {
+            continue; // girou no meio do anúncio: não toca nunca
+        }
+        match play_fragment(&cfg, task.fragment, rodada, &epoch) {
+            Ok(()) => {
+                if rodada == epoch.load(Ordering::SeqCst) {
+                    let _ = events.send(TtsEvent::Finished(Ok(())));
+                }
+            }
+            Err(e) => {
+                if rodada == epoch.load(Ordering::SeqCst) {
+                    let _ = events.send(TtsEvent::Finished(Err(e)));
+                }
+                // rodada antiga: Interrupted já foi anunciado pela fila
+            }
+        }
+    }
 }
 
 fn tmp_wav_path(cfg: &SpeakerConfig) -> Result<PathBuf, TtsError> {
@@ -319,7 +474,8 @@ fn tmp_wav_path(cfg: &SpeakerConfig) -> Result<PathBuf, TtsError> {
 fn render_fragment(
     cfg: &SpeakerConfig,
     sentence: &str,
-    cancel: &Arc<AtomicBool>,
+    rodada: u64,
+    epoch: &AtomicU64,
 ) -> Result<Fragment, TtsError> {
     let file_mode = cfg.piper_output == "file";
     let mut parts: Vec<String> = Vec::with_capacity(cfg.piper_command.len());
@@ -355,17 +511,16 @@ fn render_fragment(
 
     if let Some(mut stdin) = child.stdin.take() {
         let to_write = sentence.as_bytes().to_vec();
-        let cancel_flag = cancel.clone();
         let _ = std::thread::Builder::new()
             .name("piper-feed".into())
             .spawn(move || {
-                if !cancel_flag.load(Ordering::SeqCst) {
-                    let _ = stdin.write_all(&to_write);
-                }
+                // Escreve de uma vez: se a rodada girou, o grupo morre logo e
+                // a escrita falha inofensivamente (pipe quebrado).
+                let _ = stdin.write_all(&to_write);
             });
     }
 
-    let result = collect_piper_output(cfg, &mut child, temp_path.as_deref(), cancel);
+    let result = collect_piper_output(cfg, &mut child, temp_path.as_deref(), rodada, epoch);
     kill_group(pgid);
     let _ = child.wait();
     if let Some(tmp) = &temp_path {
@@ -390,12 +545,13 @@ fn collect_piper_output(
     cfg: &SpeakerConfig,
     child: &mut std::process::Child,
     temp_path: Option<&Path>,
-    cancel: &Arc<AtomicBool>,
+    rodada: u64,
+    epoch: &AtomicU64,
 ) -> Result<Vec<u8>, TtsError> {
     let deadline = Instant::now() + Duration::from_secs(cfg.timeout_secs);
     if let Some(path) = temp_path {
         loop {
-            if cancel.load(Ordering::SeqCst) {
+            if rodada != epoch.load(Ordering::SeqCst) {
                 return Err(TtsError("interrompido".into()));
             }
             if Instant::now() >= deadline {
@@ -427,7 +583,7 @@ fn collect_piper_output(
             .ok_or_else(|| TtsError("sem saída padrão do piper".into()))?;
         let mut buf = [0u8; 4096];
         loop {
-            if cancel.load(Ordering::SeqCst) {
+            if rodada != epoch.load(Ordering::SeqCst) {
                 return Err(TtsError("interrompido".into()));
             }
             if Instant::now() >= deadline {
@@ -461,11 +617,14 @@ fn collect_piper_output(
 }
 
 /// O reprodutor recebe os bytes por `/dev/stdin` (o `{file}` no comando do
-/// reprodutor é substituído por `/dev/stdin`).
+/// reprodutor é substituído por `/dev/stdin`). Um processo por fragmento,
+/// mas o pipeline mantém o próximo áudio quase pronto: a troca de fragmento
+/// não deixa a voz em silêncio por centenas de milissegundos.
 fn play_fragment(
     cfg: &SpeakerConfig,
     fragment: Fragment,
-    cancel: &Arc<AtomicBool>,
+    rodada: u64,
+    epoch: &AtomicU64,
 ) -> Result<(), TtsError> {
     let mut parts: Vec<String> = Vec::with_capacity(cfg.player_command.len());
     let mut piped = false;
@@ -502,7 +661,7 @@ fn play_fragment(
     let min_wait = Duration::from_secs(fragment.bytes.len() as u64 / 162_000 + 1);
     let deadline = Instant::now() + Duration::from_secs(cfg.timeout_secs).max(min_wait * 4);
     loop {
-        if cancel.load(Ordering::SeqCst) {
+        if rodada != epoch.load(Ordering::SeqCst) {
             kill_group(pgid);
             let _ = child.wait();
             return Err(TtsError("interrompido".into()));
@@ -605,6 +764,30 @@ mod tests {
         out.extend_from_slice(&(data_len as u32).to_le_bytes());
         out.extend_from_slice(&[0u8; 2]);
         out
+    }
+
+    #[test]
+    fn frases_curtas_sao_unidas_e_a_ordem_e_preservada() {
+        // fragmento miúdo demais soa como gagueira: a fila une as curtas
+        let mut q: VecDeque<String> = ["a.", "b.", "c."].iter().map(|s| s.to_string()).collect();
+        let f = proximo_fragmento(&mut q).unwrap();
+        assert_eq!(f, "a. b. c.");
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn frase_longa_vai_sozinha_e_a_seguinte_fica_na_fila() {
+        let longa = "l".repeat(FRAG_MINIMO_CHARS);
+        let mut q: VecDeque<String> = [longa.clone(), "curta.".into()].into();
+        assert_eq!(proximo_fragmento(&mut q).unwrap(), longa);
+        assert_eq!(proximo_fragmento(&mut q).unwrap(), "curta.");
+        assert!(proximo_fragmento(&mut q).is_none());
+    }
+
+    #[test]
+    fn fila_vazia_nao_tem_fragmento() {
+        let mut q: VecDeque<String> = VecDeque::new();
+        assert!(proximo_fragmento(&mut q).is_none());
     }
 
     #[test]

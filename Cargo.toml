@@ -18,6 +18,14 @@ path = "src/main.rs"
 name = "sexta-mock-agente"
 path = "src/bin/mock_agent.rs"
 
+[[bin]]
+name = "sexta-mock-piper"
+path = "src/bin/mock_piper.rs"
+
+[[bin]]
+name = "sexta-mock-player"
+path = "src/bin/mock_player.rs"
+
 [dependencies]
 clap = { version = "4", default-features = false, features = [
     "std",

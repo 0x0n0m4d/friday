@@ -228,6 +228,44 @@ a lembretes de ferramenta.
 
 ---
 
+## D15. Voz: pipeline em três fios (fila → piper-synth → voz-player)
+
+**Motivo (2026-11-25):** dois relatos em campo — (a) o Piper só começava depois de a resposta
+inteira terminar de chegar; (b) travas (silêncios) no meio da fala.
+
+**Causa-raiz: NADA no daemon.** Provas no código do ZeroClaw v0.9.0:
+`zeroclaw-runtime/src/agent/turn/stream_consume.rs:180` — cada delta do modelo vira
+`TurnEvent::Chunk` enviado na hora; `zeroclaw-channels/src/orchestrator/acp_server.rs:2283`
+(Chunk só acumula para persistência) e `:2303` (cada evento vira `session/update` imediata) —
+streaming real, chunk a chunk. O gargalo era o falante da sexta-feira: serial por frase
+(`render_and_play` esperava o WAV completo + o fim do player antes de puxar o próximo `Speak`),
+um spawn de Piper + player POR frase — e ainda frases curtas de listas quebravam em fragmentos
+minúsculos: silêncio entre cada um, o "trava no meio da frase".
+
+**Decisão (src/tts.rs):**
+
+- Três fios: fila (ordem única — nada fala fora de vez) alimenta `piper-synth`, que manda WAVs
+  prontos por canal ACOTADO (2) para `voz-player`; enquanto uma frase TOCA, a próxima já é
+  sintetizada. Backpressure estrutural: no máximo 2 áudios em antecipação na memória, nunca o
+  turno inteiro.
+- Interrupção por `epoch` (rodada de fala): o Interrupt aumenta a rodada; síntese em voo, áudio
+  em reprodução e fila atrasada viram lixo e são descartados. Sem flag booleana de cancelamento
+  (e sem a corrida de reinício dela).
+- Coalescência: frases curtas unem-se ao que vier até `FRAG_MINIMO_CHARS` (120) — menos spawns
+  de processo e menos silêncio audível entre fragmentos.
+- Fala parcial (src/app.rs): texto corrido sem pontuação à vista vira fala no primeiro espaço
+  depois de `FALA_PARCIAL_CHARS` (240) — a voz acompanha o streaming em vez de esperar o fim do
+  turno.
+- `Started` é anunciado quando o áudio TOCA (voz-player), não quando a síntese começa.
+- Falha de síntese/reprodução (timeout, teto de bytes, piper morto): evento `Finished(Err)` +
+  fragmento pulado; a fila segue e o falante sobrevive. Falha nunca silenciosa.
+
+**Testes:** `tests/tts_pipeline.rs`, com processos-mock reais (`sexta-mock-piper`,
+`sexta-mock-player`): ordem e integridade dos bytes no reprodutor; falha isolada não mata a
+fila; corte descarta a rodada antiga inteira e o falante continua servindo a nova.
+
+---
+
 ## Itens VERIFY (incertos que dependem da instalação do usuário)
 
 | Item | Onde | Por quê |

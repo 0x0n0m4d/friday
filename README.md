@@ -9,7 +9,8 @@ com o **comando que você configurar**, transcreve com o seu **Whisper** local e
 seu **Piper** + reprodutor. Nenhum comando externo, tecla ou porta está fixo no código: tudo vem do
 arquivo de configuração.
 
-- Binário: `sexta-feira` (mais `sexta-mock-agente`, um agente ACP de mentira para testes e ensaio).
+- Binário: `sexta-feira` (mais os auxiliares de ensaio `sexta-mock-agente`, `sexta-mock-piper` e
+  `sexta-mock-player`, agentes/programas de mentira para testes).
 - Escrito em Rust 1.100, sem `sh -c` em lugar nenhum, sem segredos no arquivo de configuração.
 
 ---
@@ -46,7 +47,8 @@ Script de verificação completo (formatação, cheque, testes, clippy e build):
 ./scripts/verify.sh
 ```
 
-Os binários ficam em `target/release/sexta-feira` e `target/release/sexta-mock-agente`.
+Os binários ficam em `target/release/sexta-feira` e nos auxiliares de ensaio
+(`sexta-mock-agente`, `sexta-mock-piper`, `sexta-mock-player`).
 
 ---
 
@@ -258,6 +260,29 @@ quando você quiser: aponte o **nome** da variável em `[acp].token_env` (por ex
 `ZEROCLAW_ACP_TOKEN`) e exporte o valor no seu shell. Se o gateway não exigir token, deixe
 `token_env` de fora.
 
+### 4.5 Voz: como o streaming funciona (Piper + reprodutor)
+
+A voz NÃO espera a resposta terminar — ela acompanha o streaming do daemon (que manda
+cada pedaço do modelo como chega). O falante é um pipeline de três fios:
+
+```
+fila (ordem) ──► piper-synth ──canal acotado (2)──► voz-player
+```
+
+- Enquanto uma frase TOCA, a próxima já está sendo sintetizada: sem "recebe tudo, depois
+  fala". O canal tem vaga para no máximo 2 áudios — antecipação limitada, memória teto.
+- Frases curtas (listas, saudações) são unidas até ~120 caracteres por fragmento: menos
+  spawns de processo, menos silêncio entre áudios (o fim das travas no meio da frase).
+- Modelo escrevendo corrido sem pontuação: um trecho de ~240 caracteres vira fala
+  parcial no primeiro espaço — a voz não fica muda até o fim do turno.
+- Falha de síntese (timeout, áudio regressado ou maior que o teto): a frase é pulada, o
+  erro aparece na barra de status e o falante continua vivo para as próximas.
+- Tecla de voz/Esc: corte por rodada (`epoch`) — síntese em voo, áudio tocando e fila
+  inteira somem na hora, e o falante segue servindo as filas novas sem reinício sujo.
+
+`[piper].output` funciona igual ao antes: `stdout` (WAV sai na saída padrão) ou `file`
+(piper grava no `{file}`); `{file}` do reprodutor continua virando `/dev/stdin`.
+
 ---
 
 ## 5. Rodar
@@ -318,7 +343,9 @@ antes de entrar no log).
 O projeto inclui um **agente ACP simulado** (`sexta-mock-agente`) que fala o subconjunto do
 protocolo usado pelo cliente — versões, `session/new`, streaming em duas partes, pedido de
 permissão, SESSION_BUSY, sessão desconhecida e linha malformada. Os testes automatizados usam esse
-simulador e programas falsos para gravador/Whisper/Piper/reprodutor; **nenhum teste** toca áudio
+simulador e programas falsos para gravador/Whisper; o pipeline de voz usa os mocks
+`sexta-mock-piper` (Piper em WAV PCM na saída padrão) e `sexta-mock-player` (reprodutor que
+devolve ao log os bytes recebidos); **nenhum teste** toca áudio
 real, dispositivos reais, teclado real, rede além de loopback ou o seu daemon.
 
 Para ensaiar manualmente contra o simulador, suba ele WebSocket e aponte a `[acp].url` para ele:
