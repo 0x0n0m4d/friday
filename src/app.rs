@@ -86,8 +86,18 @@ pub struct App {
     pub input: String,
     pub input_frozen_draft: Option<String>,
     pub status: Status,
+    /// Distância (em linhas visuais) entre o fundo da tela e a última linha
+    /// exibida. 0 = colado no fim. A chegada de mensagens NÃO mexe aqui:
+    /// o chat é um log — quem move a visualização é o usuário.
     pub scroll_offset: usize,
+    /// Verdadeiro quando a tela acompanha o fundo (estado inicial). Fica
+    /// falso no primeiro Ctrl+U e volta só num Ctrl+D até o fim ou quando o
+    /// usuário envia mensagem própria.
     pub follow_tail: bool,
+    /// Altura visível do chat (sem bordas), medida no último quadro. O salto
+    /// de meia página do Ctrl+U/Ctrl+D depende dela; antes do primeiro
+    /// quadro vale 1, só para o salto existir.
+    pub viewport_rows: std::cell::Cell<u16>,
 
     pub acp: Option<AcpClient>,
     pub session_id: Option<String>,
@@ -160,6 +170,7 @@ impl App {
             status: Status::Idle,
             scroll_offset: 0,
             follow_tail: true,
+            viewport_rows: std::cell::Cell::new(0),
             acp: None,
             session_id: None,
             init_phase: None,
@@ -195,12 +206,7 @@ impl App {
     pub fn diag(&mut self, text: String) {
         self.log.log_event("diag", &[("texto", json!(text))]);
         if self.verbose {
-            self.chat.push(ChatItem {
-                author: Author::Diag,
-                text,
-            });
-            self.trim_chat();
-            self.follow_tail = true;
+            self.adiciona_chat(Author::Diag, text);
         }
     }
 
@@ -398,12 +404,23 @@ impl App {
     }
 
     pub fn info(&mut self, text: String) {
-        self.chat.push(ChatItem {
-            author: Author::Info,
-            text,
-        });
+        self.adiciona_chat(Author::Info, text);
+    }
+
+    /// Coloca um item no log do chat. NÃO toca na visualização: o chat é um
+    /// log — a chegada de mensagens nunca arrasta a tela; quem move a
+    /// visualização é o usuário (Ctrl+U/Ctrl+D). Exceção única, decidida por
+    /// quem chama: o envio de mensagem do próprio usuário volta ao fundo.
+    fn adiciona_chat(&mut self, author: Author, text: String) {
+        self.chat.push(ChatItem { author, text });
         self.trim_chat();
-        self.follow_tail = true;
+    }
+
+    /// Metade da altura visível do chat (viewport medido no último quadro
+    /// desenhado). Antes do primeiro quadro o viewport vale 1: o salto
+    /// existe, é só curto — primeiro Ctrl+U já destaca a tela do fundo.
+    pub fn meia_pagina(&self) -> usize {
+        (self.viewport_rows.get() as usize / 2).max(1)
     }
 
     fn trim_chat(&mut self) {
@@ -454,15 +471,16 @@ impl App {
             return false;
         };
         self.status = Status::Waiting;
-        self.chat.push(ChatItem {
-            author: Author::User,
-            text: if from_voice {
+        // Exceção única da regra do log: mensagem do PRÓPRIO usuário volta a
+        // tela ao fundo — é ele falando, não o sistema mexendo na tela dele.
+        self.adiciona_chat(
+            Author::User,
+            if from_voice {
                 format!("{sanitized}  (por voz)")
             } else {
                 sanitized.clone()
             },
-        });
-        self.trim_chat();
+        );
         self.follow_tail = true;
         let Some(acp) = self.acp.as_mut() else {
             self.retry_text = Some(sanitized);
@@ -806,7 +824,6 @@ impl App {
                     }
                 };
                 self.trim_chat();
-                self.follow_tail = true;
                 if !replay {
                     self.speak_accumulated(&chunk);
                 }
@@ -818,23 +835,13 @@ impl App {
                 // Só chega em replay de session/load: linha do histórico do
                 // próprio usuário. Exibe; mensagem de história não repete,
                 // não fala e não progride fila de reenvio alguma.
-                self.chat.push(ChatItem {
-                    author: Author::User,
-                    text,
-                });
-                self.trim_chat();
-                self.follow_tail = true;
+                self.adiciona_chat(Author::User, text);
             }
             SessionUpdate::ToolCall { title, status } => {
                 if self.engolir_replay {
                     return; // reconexão: a tela é o log; a linha não entra
                 }
-                self.chat.push(ChatItem {
-                    author: Author::Info,
-                    text: format!("ferramenta: {title} — {status}"),
-                });
-                self.trim_chat();
-                self.follow_tail = true;
+                self.adiciona_chat(Author::Info, format!("ferramenta: {title} — {status}"));
             }
             SessionUpdate::ToolCallUpdate {
                 tool_call_id,
@@ -1203,10 +1210,21 @@ impl App {
                 self.send_prompt(&text, false);
             }
             ScrollUp => {
-                self.scroll_offset = self.scroll_offset.saturating_add(3);
+                // Ctrl+U: sobe meia página. A tela fica ONDE O USUÁRIO COLOU:
+                // mensagens que chegam não arrastam a visualização de volta
+                // (o chat é um log, não um vitrine que se rearranja).
+                self.follow_tail = false;
+                self.scroll_offset = self.scroll_offset.saturating_add(self.meia_pagina());
             }
             ScrollDown => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                // Ctrl+D: desce meia página; chegar ao fundo reengula o
+                // acompanhamento (novas mensagens voltam a rolar a tela).
+                if self.scroll_offset <= self.meia_pagina() {
+                    self.scroll_offset = 0;
+                    self.follow_tail = true;
+                } else {
+                    self.scroll_offset -= self.meia_pagina();
+                }
             }
             Backspace => {
                 self.input.pop();
@@ -1301,12 +1319,10 @@ impl App {
     pub fn on_key_source_failed(&mut self, reason: String) {
         self.log.log_error("erro_ptt", &reason);
         if self.verbose {
-            self.chat.push(ChatItem {
-                author: Author::Diag,
-                text: format!("[ptt] linha da tecla falhou: {reason}"),
-            });
-            self.trim_chat();
-            self.follow_tail = true;
+            self.adiciona_chat(
+                Author::Diag,
+                format!("[ptt] linha da tecla falhou: {reason}"),
+            );
         }
     }
 }

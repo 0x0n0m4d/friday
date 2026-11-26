@@ -58,8 +58,15 @@ pub mod key_parse {
             KeyCode::Backspace => Some(ParsedKey::Backspace),
             KeyCode::Up => Some(ParsedKey::ModalUp),
             KeyCode::Down => Some(ParsedKey::ModalDown),
-            KeyCode::PageUp => Some(ParsedKey::ScrollUp),
-            KeyCode::PageDown => Some(ParsedKey::ScrollDown),
+            // Rolagem por Ctrl+U/Ctrl+D (semântica less/vim: meia página por
+            // toque). Tem de vir ANTES do catch-all de InsertChar, senão o
+            // 'u'/'d' vira texto na caixa de entrada com Ctrl apertado.
+            KeyCode::Char('u') if ev.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(ParsedKey::ScrollUp)
+            }
+            KeyCode::Char('d') if ev.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(ParsedKey::ScrollDown)
+            }
             KeyCode::Char(c) => Some(ParsedKey::InsertChar(c)),
             _ => None,
         }
@@ -279,7 +286,35 @@ pub fn draw(app: &App, f: &mut Frame) {
     }
 }
 
+/// Fatiamento por COLUNAS de terminal: quebra `texto` em pedaços de largura
+/// visual ≤ `largura` (emoji/largura-dupla contam certo via unicode-width).
+// A causa do "texto sobressaindo" era o descasamento entre o offset calculado
+// em linhas lógicas e o render do Paragraph, que rola linhas VISUAIS (com o
+// wrap do widget). Fatiamos ourselves: 1 Line = 1 linha visível — o offset
+// passa a ser exato, e a âncora no fundo nunca corta a última frase.
+fn fatia_por_colunas(texto: &str, largura: usize) -> Vec<String> {
+    let largura = largura.max(4); // janela mínima absurda: degrada, não trava
+    let mut partes: Vec<String> = Vec::new();
+    let mut atual = String::new();
+    let mut usado = 0usize;
+    for c in texto.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if usado + w > largura && !atual.is_empty() {
+            partes.push(std::mem::take(&mut atual));
+            usado = 0;
+        }
+        atual.push(c);
+        usado += w;
+    }
+    if !atual.is_empty() || partes.is_empty() {
+        partes.push(atual);
+    }
+    partes
+}
+
 fn draw_chat(app: &App, f: &mut Frame, area: Rect) {
+    // -2: bordas do bloco; é este o wrap width efetivo do widget interno.
+    let largura = area.width.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::new();
     for item in &app.chat {
         let label = match item.author {
@@ -294,36 +329,53 @@ fn draw_chat(app: &App, f: &mut Frame, area: Rect) {
             Author::Info => Color::DarkGray,
             Author::Diag => Color::Yellow,
         };
-        let text = item.rendered();
-        for (i, part) in text.lines().enumerate() {
-            let mut spans: Vec<Span> = Vec::new();
-            if i == 0 {
-                spans.push(Span::styled(
-                    format!("{label}: "),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ));
+        let prefixo = Span::styled(
+            format!("{label}: "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        );
+        let texto = sanitize::strip_escapes_and_control(&item.rendered());
+        for (i, bruta) in texto.lines().enumerate() {
+            let (prefixo_linha, cols): (Option<Span>, usize) = if i == 0 {
+                let w = unicode_width::UnicodeWidthStr::width(prefixo.content.as_ref());
+                (Some(prefixo.clone()), w)
             } else {
-                spans.push(Span::raw("             "));
+                // continuação do mesmo item: alinhada sob o rótulo
+                (None, 13)
+            };
+            let texto_padrao = Span::raw("             ");
+            let disp = largura.saturating_sub(cols).max(4);
+            for (j, pedaco) in fatia_por_colunas(bruta, disp).into_iter().enumerate() {
+                let mut spans: Vec<Span> = Vec::new();
+                if j == 0 {
+                    if let Some(p) = &prefixo_linha {
+                        spans.push(p.clone());
+                    } else {
+                        spans.push(texto_padrao.clone());
+                    }
+                }
+                spans.push(Span::raw(pedaco));
+                lines.push(Line::from(spans));
             }
-            spans.push(Span::raw(sanitize::strip_escapes_and_control(part)));
-            lines.push(Line::from(spans));
         }
     }
     let total = lines.len();
     let visible = area.height.saturating_sub(2) as usize;
-    let scroll = if app.follow_tail {
-        total.saturating_sub(visible) as u16
+    app.viewport_rows.set(visible as u16);
+    // âncora pelo FUNDO: novidade chegando não desloca uma tela que o usuário
+    // rolou manualmente; com follow_tail o offset é exatamente a última linha
+    let de_fundo = if app.follow_tail {
+        0usize
     } else {
-        app.scroll_offset as u16
+        app.scroll_offset
     };
+    let scroll = total.saturating_sub(visible).saturating_sub(de_fundo);
     let chat = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Sexta-feira "),
         )
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+        .scroll((scroll as u16, 0));
     f.render_widget(chat, area);
 }
 
@@ -346,6 +398,45 @@ fn draw_input(app: &App, f: &mut Frame, area: Rect) {
     }
 }
 
+/// Nome de tecla legível para o código evdev configurado (levantado do
+/// /usr/include/linux/input-event-codes.h). Nada sai de caminho de dispositivo
+/// nem número cru na tela: "[voz] alt-right" diz tudo que interessa.
+fn nome_da_tecla_evdev(code: u16) -> String {
+    let nome = match code {
+        1 => "esc",
+        14 => "backspace",
+        15 => "tab",
+        28 => "enter",
+        29 => "ctrl-left",
+        42 => "shift-left",
+        54 => "shift-right",
+        56 => "alt-left",
+        57 => "espaco",
+        58 => "caps-lock",
+        69 => "num-lock",
+        70 => "scroll-lock",
+        87 => "f11",
+        88 => "f12",
+        97 => "ctrl-right",
+        100 => "alt-right",
+        102 => "home",
+        104 => "pgup",
+        105 => "seta-esq",
+        106 => "seta-dir",
+        107 => "end",
+        108 => "seta-baixo",
+        109 => "pgdn",
+        110 => "insert",
+        111 => "delete",
+        119 => "pause",
+        125 => "super-left",
+        126 => "super-right",
+        59..=68 => return format!("f{}", code - 58), // F1..F10 são sequenciais
+        outro => return format!("tecla {outro}"),
+    };
+    nome.to_string()
+}
+
 fn draw_status(app: &App, f: &mut Frame, area: Rect) {
     let (status_text, status_color) = match &app.status {
         Status::Idle => ("Pronto", Color::Gray),
@@ -357,25 +448,41 @@ fn draw_status(app: &App, f: &mut Frame, area: Rect) {
         Status::Approval => ("Aprovação necessária (teclado)", Color::LightRed),
         Status::Error(e) => (e.as_str(), Color::Red),
     };
-    let ptt_hint = match app.cfg.push_to_talk.mode.as_str() {
-        "hold" => match (
-            app.cfg.push_to_talk.device.clone(),
-            app.cfg.push_to_talk.code,
-        ) {
-            (Some(d), Some(c)) => format!(" · [voz] {d} tecla {c}"),
-            _ => String::new(),
-        },
-        _ => format!(" · [voz] alterna {}", app.cfg.push_to_talk.fallback_key),
-    };
-    let line = Line::from(vec![
-        Span::styled(
-            format!(" {status_text} "),
+    // ESQUERDA: só o estado. Nada mais disputa a atenção ali.
+    let chip = format!(" {status_text} ");
+    let largura_chip = unicode_width::UnicodeWidthStr::width(chip.as_str())
+        .min(area.width.saturating_sub(1) as usize) as u16;
+    let areas = Layout::default()
+        .direction(ratatui::layout::Direction::Horizontal)
+        .constraints([Constraint::Length(largura_chip), Constraint::Min(0)])
+        .split(area);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            chip,
             Style::default().fg(Color::Black).bg(status_color),
-        ),
-        Span::styled(ptt_hint, Style::default().fg(Color::DarkGray)),
-        Span::raw(" ─ Esc cancela · Enter envia · PgUp/PgDn rola · Ctrl+C sai"),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+        ))),
+        areas[0],
+    );
+    // DIREITA: o mínimo que não é óbvio — voz, cancelamento e rolagem.
+    // Fora: Enter envia (óbvio), Ctrl+C (óbvio num terminal), dispositivo
+    // e código cru da tecla de voz (ruído).
+    let voz = if app.cfg.push_to_talk.mode == "hold" {
+        app.cfg
+            .push_to_talk
+            .code
+            .map(|c| format!("[voz] {} · ", nome_da_tecla_evdev(c)))
+            .unwrap_or_default()
+    } else {
+        format!("[voz] alterna {} · ", app.cfg.push_to_talk.fallback_key)
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("{voz}Esc cancela · Ctrl+U/Ctrl+D rola "),
+            Style::default().fg(Color::DarkGray),
+        )))
+        .alignment(Alignment::Right),
+        areas[1],
+    );
 }
 
 fn draw_modal(app: &App, f: &mut Frame, area: Rect) {
@@ -414,4 +521,67 @@ fn draw_modal(app: &App, f: &mut Frame, area: Rect) {
         .alignment(Alignment::Left)
         .wrap(Wrap { trim: false });
     f.render_widget(p, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fatia_respeita_largura_e_nao_perde_caractere() {
+        let pedacos = fatia_por_colunas("abcdefghij", 4);
+        assert_eq!(pedacos, vec!["abcd", "efgh", "ij"]);
+        // recomposição: nada se perde nem se duplica
+        assert_eq!(pedacos.concat(), "abcdefghij");
+    }
+
+    #[test]
+    fn largura_dupla_emoji_nao_estoura_a_coluna() {
+        // 🎉 vale 2 colunas: 3 emojis não cabem em largura 5
+        let pedacos = fatia_por_colunas("🎉🎉🎉", 5);
+        assert_eq!(pedacos.len(), 2);
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(pedacos[0].as_str()),
+            4
+        );
+    }
+
+    #[test]
+    fn linha_vazia_gera_uma_parte_unica() {
+        assert_eq!(fatia_por_colunas("", 10), vec![String::new()]);
+        assert_eq!(fatia_por_colunas("ok", 10), vec!["ok"]);
+    }
+
+    #[test]
+    fn tecla_do_dispositivo_vira_nome_legivel() {
+        // 100 = KEY_RIGHTALT (KEY_LEFTALT é 56): o relato em campo
+        assert_eq!(nome_da_tecla_evdev(100), "alt-right");
+        assert_eq!(nome_da_tecla_evdev(57), "espaco");
+        // F1..F10 são sequenciais a partir de 59
+        assert_eq!(nome_da_tecla_evdev(59), "f1");
+        assert_eq!(nome_da_tecla_evdev(68), "f10");
+        // código desconhecido degrada para identificável, nunca some
+        assert_eq!(nome_da_tecla_evdev(999), "tecla 999");
+    }
+
+    #[test]
+    fn ctrl_rolagem_nao_vira_texto_na_entrada() {
+        let ev = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('u'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        assert!(matches!(
+            key_parse::parse_key(&ev, None),
+            Some(ParsedKey::ScrollUp)
+        ));
+        // sem Ctrl, o 'u' continua digitando
+        let ev_solto = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('u'),
+            crossterm::event::KeyModifiers::empty(),
+        );
+        assert!(matches!(
+            key_parse::parse_key(&ev_solto, None),
+            Some(ParsedKey::InsertChar('u'))
+        ));
+    }
 }

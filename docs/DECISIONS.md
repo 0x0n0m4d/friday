@@ -68,7 +68,7 @@ Testado em `tests/app_flow.rs::voz_enquanto_ocupado_fica_na_fila_e_vai_depois`.
 ## D8. Teclas da TUI (brief §11.7)
 
 - `Enter` envia; `Esc` cancela o turno (se `[acp].esc_cancels`) ou responde "cancelled" ao modal;
-- `Ctrl+C` sai; `PgUp`/`PgDn` rola; setas navegam no modal;
+- `Ctrl+C` sai; `Ctrl+U`/`Ctrl+D` rolam meia página (D15); setas navegam no modal;
 - o mute da voz NÃO existe no cliente (recurso removido por decisão do usuário: mutar é
   papel do microfone/SO; letras `m`/`M` digitam normalmente);
 - a tecla de voz vem do evdev (`hold`) ou do `fallback_key` (`toggle`);
@@ -228,43 +228,27 @@ a lembretes de ferramenta.
 
 ---
 
-## D15. Voz: pipeline em três fios (fila → piper-synth → voz-player)
+## D15. A tela é um LOG (rolagem Ctrl+U/Ctrl+D e barra de status mínima)
 
-**Motivo (2026-11-25):** dois relatos em campo — (a) o Piper só começava depois de a resposta
-inteira terminar de chegar; (b) travas (silêncios) no meio da fala.
+O chat é um mostrador de mensagens: a chegada de mensagens nunca move a visualização.
 
-**Causa-raiz: NADA no daemon.** Provas no código do ZeroClaw v0.9.0:
-`zeroclaw-runtime/src/agent/turn/stream_consume.rs:180` — cada delta do modelo vira
-`TurnEvent::Chunk` enviado na hora; `zeroclaw-channels/src/orchestrator/acp_server.rs:2283`
-(Chunk só acumula para persistência) e `:2303` (cada evento vira `session/update` imediata) —
-streaming real, chunk a chunk. O gargalo era o falante da sexta-feira: serial por frase
-(`render_and_play` esperava o WAV completo + o fim do player antes de puxar o próximo `Speak`),
-um spawn de Piper + player POR frase — e ainda frases curtas de listas quebravam em fragmentos
-minúsculos: silêncio entre cada um, o "trava no meio da frase".
+- `Ctrl+U`/`Ctrl+D` rolam meia página por toque (substituem `PgUp`/`PgDn`);
+- o offset é ancorado no FUNDO: novidades chegam sem deslocar uma tela que o usuário rolou
+  manualmente (antigamente cada mensagem rearmava `follow_tail` e puxava a tela de volta ao fim —
+  era a "tela estática/incontrolável");
+- voltar a acompanhar o fundo: `Ctrl+D` até o fim, ou envio de mensagem do próprio usuário;
+- render por colunas exatas (`src/tui.rs::fatia_por_colunas`, unicode-width, 1 `Line` = 1 linha
+  visível): elimina o descasamento entre offset em linha lógica e render em linha quebrada que
+  fazia o texto sobrar/cortar e o PgUp/PgDn "não pegar";
+- barra de status: SÓ o estado à esquerda; à direita só o não-óbvio — `[voz] <tecla legível>`,
+  `Esc cancela`, `Ctrl+U/Ctrl+D rola`. Sem Enter envia/Ctrl+C (óbvio num terminal) e sem
+  dispositivo/código cru da tecla (ruído);
+- a tecla do evdev sai com nome amigável (`nome_da_tecla_evdev`: código 100 → `alt-right`,
+  `f<n>`, etc.; código desconhecido degrada como `tecla <n>`, nunca some).
 
-**Decisão (src/tts.rs):**
-
-- Três fios: fila (ordem única — nada fala fora de vez) alimenta `piper-synth`, que manda WAVs
-  prontos por canal ACOTADO (2) para `voz-player`; enquanto uma frase TOCA, a próxima já é
-  sintetizada. Backpressure estrutural: no máximo 2 áudios em antecipação na memória, nunca o
-  turno inteiro.
-- Interrupção por `epoch` (rodada de fala): o Interrupt aumenta a rodada; síntese em voo, áudio
-  em reprodução e fila atrasada viram lixo e são descartados. Sem flag booleana de cancelamento
-  (e sem a corrida de reinício dela).
-- Coalescência: frases curtas unem-se ao que vier até `FRAG_MINIMO_CHARS` (120) — menos spawns
-  de processo e menos silêncio audível entre fragmentos.
-- Fala parcial (src/app.rs): texto corrido sem pontuação à vista vira fala no primeiro espaço
-  depois de `FALA_PARCIAL_CHARS` (240) — a voz acompanha o streaming em vez de esperar o fim do
-  turno.
-- `Started` é anunciado quando o áudio TOCA (voz-player), não quando a síntese começa.
-- Falha de síntese/reprodução (timeout, teto de bytes, piper morto): evento `Finished(Err)` +
-  fragmento pulado; a fila segue e o falante sobrevive. Falha nunca silenciosa.
-
-**Testes:** `tests/tts_pipeline.rs`, com processos-mock reais (`sexta-mock-piper`,
-`sexta-mock-player`): ordem e integridade dos bytes no reprodutor; falha isolada não mata a
-fila; corte descarta a rodada antiga inteira e o falante continua servindo a nova.
-
----
+Testado em testes unitários de `src/tui.rs` (fatiamento, nome de tecla, Ctrl sem virar texto) e em
+`tests/app_flow.rs` (`rolagem_meia_pagina_e_tela_estavel_como_log`,
+`mensagem_do_usuario_volta_ao_fundo_agente_nao`).
 
 ## Itens VERIFY (incertos que dependem da instalação do usuário)
 

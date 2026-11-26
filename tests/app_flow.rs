@@ -598,3 +598,68 @@ fn verbose_avisa_handshake_sem_resposta() {
     assert_eq!(app.init_phase, Some(InitPhase::Initializing));
     app.teardown();
 }
+
+/// A tela é um log: Ctrl+U/Ctrl+D rolam meia página por toque, a chegada de
+/// mensagens NÃO arrasta a visualização de volta ao fundo, e o fundo só é
+/// reengulado por Ctrl+D até o fim ou mensagem do próprio usuário.
+#[test]
+fn rolagem_meia_pagina_e_tela_estavel_como_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _rx, _sim) = make_app(&[], tmp.path());
+    // viewport de 24 linhas: meia página = 12
+    app.viewport_rows.set(24);
+    assert!(app.follow_tail);
+
+    // Ctrl+U: destaca do fundo; offset é distância do FUNDO
+    app.on_key(ParsedKey::ScrollUp);
+    assert!(!app.follow_tail);
+    assert_eq!(app.scroll_offset, 12);
+    app.on_key(ParsedKey::ScrollUp);
+    assert_eq!(app.scroll_offset, 24);
+
+    // Ctrl+D: desce a mesma medida; ainda longe do fundo, continua solto
+    app.on_key(ParsedKey::ScrollDown);
+    assert_eq!(app.scroll_offset, 12);
+    assert!(!app.follow_tail);
+
+    // chegada de mensagem (info, como as do agente) NÃO volta a tela ao fundo
+    app.info("linha nova que chega enquanto eu li até aqui".into());
+    assert!(!app.follow_tail, "log não arrasta a tela");
+
+    // Ctrl+D até o fundo reengula o acompanhamento
+    app.on_key(ParsedKey::ScrollDown);
+    assert_eq!(app.scroll_offset, 0);
+    assert!(app.follow_tail);
+
+    app.teardown();
+}
+
+/// Reminder removido há tempos: mensagem do próprio usuário volta ao fundo
+/// (é ele falando), mas mensagens que chegam do agente não tocam na tela.
+#[test]
+fn mensagem_do_usuario_volta_ao_fundo_agente_nao() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _rx, _sim) = make_app(&[], tmp.path());
+    app.viewport_rows.set(24);
+
+    // sessão tem de existir: sem handshake, o send_prompt cai fora antes de
+    // tocar na tela (mensagem viraria reenvio pendente)
+    app.start();
+    espera_ocioso(&mut app);
+    assert!(app.session_id.is_some());
+
+    app.on_key(ParsedKey::ScrollUp);
+    assert!(!app.follow_tail);
+
+    // usuário fala → tela volta ao fundo
+    app.send_prompt("procurando de novo", false);
+    assert!(app.follow_tail, "própria mensagem reengula o fundo");
+
+    // usuário rola de novo; chunk de agente chegando NÃO mexe
+    app.on_key(ParsedKey::ScrollUp);
+    assert!(!app.follow_tail);
+    app.info("pedaço do agente chegando".into());
+    assert!(!app.follow_tail);
+
+    app.teardown();
+}
