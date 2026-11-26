@@ -177,31 +177,42 @@ O restante do fluxo (gravar → transcrever → enviar → falar) é idêntico.
 
 ### 4.2 Chamada de ferramentas (tudo no lado do daemon)
 
-O modal de permissão só aparece quando o modelo emite uma **tool call de verdade** — uma resposta
-estruturada que o ZeroClaw reconhece. O comportamento correto NÃO é instruir o modelo via texto do
-prompt (a sexta-feira NÃO prefixa nada no seu prompt: seu texto vai intacto); é o provider
-entregar as especificações de ferramenta na API e o modelo RETORNAR a chamada estruturada — a
-funcionalidade interna é retornada nativamente, não impressa em texto.
+O modal de permissão só aparece quando o modelo emite uma **tool call de verdade** — algo que o
+ZeroClaw reconhece, decodifica e executa. A sexta-feira NÃO prefixa nada no seu prompt e NÃO
+descarta nada da resposta: o que o daemon entrega volta inteiro na tela.
 
-No ZeroClaw v0.9.0 isso é controlado pelo `tool_dispatcher` do **runtime profile** do agente, no
-`~/.zeroclaw/config.toml` do daemon:
+**Como funciona de verdade no ZeroClaw v0.9.0** (provado pelos traces em
+`~/.zeroclaw/data/state/runtime-trace.jsonl`): o fluxo efetivo é o **protocolo de texto XML** — o
+system prompt documenta as ferramentas e o formato, o modelo responde com uma chamada no formato
+XML de etiqueta (<tool_call>...json...</tool_call>) e o parser interno
+(`zeroclaw-tool-call-parser`) decodifica e executa. O que separa sucesso de falha NÃO é o modelo
+e nem o provider — é o **system prompt chegar inteiro a ele**.
+
+**O corte silencioso que quebra tudo:** o `max_system_prompt_chars` do runtime profile — o preset
+`unbounded` fixa 64.000. Quando o prompt montado passa do limite, o daemon trunca **pela cauda**
+(`finalize_system_prompt` mantém o topo e descarta o fim) — e as instruções do protocolo de
+ferramenta **desaparecem sem aviso**. Sem o exemplo do formato, o modelo improvisa um objeto
+malformado (ex.: `{"path": "work.txt"}`) → `parsed_tool_calls: 0` → nada executa → o JSON vira a
+resposta final (o "printa o que deveria executar, sem resposta"). O mesmo agente pela CLI do
+daemon funcionou porque, lá, o corte caiu DEPOIS do protocolo.
+
+**Ajuste no `~/.zeroclaw/config.toml` do daemon** (nada no cliente):
 
 ```toml
-[runtime_profiles.perfil-do-agente]
-tool_dispatcher = "native"
+[runtime_profiles.unbounded]
+max_system_prompt_chars = 0   # 0 = sem limite (o truncamento só roda quando > 0)
 ```
 
-- `"native"`: as specs de ferramenta vão no campo `tools` da requisição ao provider e a resposta
-  volta com tool calls estruturados na mensagem — sem parser de texto, sem dialeto inventado, sem
-  lembrete. É o caminho principal.
-- `"xml"` (o modo texto): as ferramentas são descritas no system prompt e a resposta volta como
-  TEXTO, que um parser textual tenta decodificar; nenhum dialeto reconhecido significa
-  `parsed_tool_calls: 0` e o texto vira a resposta final — o sintoma observado (o agente "printa o
-  que deveria executar, sem resposta"). Esse modo depende de etiquetas com sinais de menor e maior
-  em texto, que nem sempre sobrevivem ao transporte.
-
-Obs.: a dica antiga de por `native_tools = true` no **provider** está desatualizada para v0.9.0 — o
-ajuste que vale é o `tool_dispatcher` no **runtime profile** acima.
+- Confirme que o agente usa o perfil que você editou: `[agents.sextafeira]` com
+  `runtime_profile = "unbounded"` — editar um perfil que o agente não aponta não muda nada.
+- Deixe `strict_tool_parsing = false` (o default do schema). Com `true`, o dispatcher XML esconde
+  o protocolo do prompt na montagem e nenhuma tool call textual é decodificada.
+- Opcional, para não morar na beira do limite: encolha o conteúdo fixo do prompt — por exemplo,
+  remova/mova para fora do workspace do agente a skill `zeroclaw-docs` (no trace ela registra
+  `Registered 0 skill tool(s)`: é só documentação pesada inflando o system prompt).
+- `tool_dispatcher = "native"` existe, mas mantenha as expectativas honestas: nos traces coletados
+  até aqui, mesmo com ele ativo, a requisição saiu com `tools_count: 0` (na CLI e no ACP).
+  Consertar o modo nativo é assunto do ZeroClaw, não do cliente.
 
 **Como conferir na prática** (reinicie o daemon primeiro):
 
@@ -209,11 +220,12 @@ ajuste que vale é o `tool_dispatcher` no **runtime profile** acima.
 tail -f ~/.zeroclaw/data/state/runtime-trace.jsonl | python3 -m json.tool --json-lines
 ```
 
-Com `tool_dispatcher = "native"` funcionando: `tools_count` maior que zero, `native_tool_calls` 1 ou
-mais e o modal de permissão aparece na sexta-feira. Se `native_tool_calls` segue em 0 com um modelo
-`:free`, o modelo declara suporte a `tools` mas não respeita na prática — a solução de fundo é
-trocar de modelo (procure `supported_parameters=tools` na OpenRouter, com function calling real),
-nunca colocar contornos no cliente.
+| O que ver no trace | O que significa |
+|---|---|
+| `parsed_tool_calls: 1` ou mais + eventos `tool_call_start`/`tool_call_result` | protocolo inteiro no prompt, ferramenta executada, resposta real na sexta-feira |
+| `parsed_tool_calls: 0` e texto crua como `turn_final_response` | o modelo não viu (ou não seguiu) o protocolo — confira `system_chars` |
+| `system_chars` exatamente igual ao seu `max_system_prompt_chars` | o prompt foi truncado pela cauda; o corte é o suspeito número 1 |
+| `tools_count` / `native_tool_calls` | pertencem só ao modo nativo; no fluxo text-XML válido, espere `tools_count: 0` e ainda assim funcionar |
 
 ### 4.3 Recarga e reconexão de sessão (o que acontece ao abrir de novo)
 
@@ -232,6 +244,10 @@ isso**:
 então nada é reexibido, nada é falado e nada se duplica: a conversa continua a partir da última
 mensagem que já estava na tela. Você é avisado de que a sessão foi retomada; a voz volta no
 próximo prompt seu.
+
+Detalhe do lado do daemon: o `session/load` do ZeroClaw só encontra a sessão no mapa **em memória
+do processo** — após reiniciar o daemon, o id salvo não existe mais lá (erro `Session not found`),
+e o cliente inicia sessão nova. É o comportamento esperado do daemon, não perda do cliente.
 
 Se a recarga não for a que você quer, use `--new-session` para começar do zero.
 
