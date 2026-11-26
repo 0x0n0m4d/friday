@@ -2,6 +2,8 @@
 //! Todo texto que sai do modelo é sanitizado antes de render.
 
 use std::io;
+use std::io::Write;
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -31,6 +33,8 @@ pub mod key_parse {
         Submit,
         ScrollUp,
         ScrollDown,
+        ToggleAutoSend,
+        OpenEditor,
         Backspace,
         InsertChar(char),
         Paste(String),
@@ -66,6 +70,15 @@ pub mod key_parse {
             }
             KeyCode::Char('d') if ev.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(ParsedKey::ScrollDown)
+            }
+            // Ctrl+A alterna o envio automático da voz; Ctrl+G abre o rascunho
+            // no editor externo. Antes do catch-all de InsertChar, senão o
+            // 'a'/'g' vira texto digitado com Ctrl apertado.
+            KeyCode::Char('a') if ev.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(ParsedKey::ToggleAutoSend)
+            }
+            KeyCode::Char('g') if ev.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(ParsedKey::OpenEditor)
             }
             KeyCode::Char(c) => Some(ParsedKey::InsertChar(c)),
             _ => None,
@@ -139,7 +152,16 @@ pub fn run(mut app: App, events_rx: Receiver<AppEvent>) {
         // é processado). Ver docs/DECISIONS.md.
         app.pump_acp(Duration::from_millis(0));
         match key_rx.recv_timeout(Duration::from_millis(25)) {
-            Ok(ev) => handle_event(&mut app, ev),
+            Ok(ev) => {
+                // Ctrl+G é outro de fluxo: o editor roda com o terminal do
+                // USUÁRIO (tela cheia), nunca dentro do painel — a TUI
+                // desce, o editor abre, e tudo volta quando ele sai.
+                if matches!(ev, AppEvent::Key(ParsedKey::OpenEditor)) {
+                    abrir_editor(&mut app, &mut terminal);
+                } else {
+                    handle_event(&mut app, ev);
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 app.events_tx.send(AppEvent::Tick).ok();
                 handle_event(&mut app, AppEvent::Tick);
@@ -225,6 +247,74 @@ fn keyboard_thread(tx: Sender<AppEvent>, toggle_key: Option<&str>) {
             }
             Err(_) => return,
             _ => {}
+        }
+    }
+}
+
+/// Mecânica do Ctrl+G, sem terminal (testável): escreve o rascunho num
+/// arquivo temporário (0600), roda o editor — argv PURO, sem shell, com o
+/// caminho como último argumento — e devolve o conteúdo do arquivo depois
+/// que o editor fecha. Mesma mecânica de `git commit`.
+pub fn editar_texto(entrada: &str, argv: &[String]) -> io::Result<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(prog) = argv.first() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "comando de editor vazio",
+        ));
+    };
+    let caminho = std::env::temp_dir().join(format!(
+        "sexta-editor-{}-{}.md",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&caminho)?
+        .write_all(entrada.as_bytes())?;
+    let status = Command::new(prog).args(&argv[1..]).arg(&caminho).status();
+    let resultado = match status {
+        Ok(s) if s.success() => std::fs::read_to_string(&caminho),
+        Ok(s) => Err(io::Error::other(format!("editor saiu com {s}"))),
+        Err(e) => Err(io::Error::other(format!(
+            "editor não executou ({prog}): {e}"
+        ))),
+    };
+    let _ = std::fs::remove_file(&caminho);
+    resultado
+}
+
+/// Ctrl+G completo: desce a TUI (raw mode/tela alternada são do editor agora),
+/// roda o editor sobre o rascunho e remarca o terminal. Falha do editor deixa
+/// o rascunho INTACTO (nada se perde silenciosamente).
+fn abrir_editor(app: &mut App, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
+    let Some(argv) = app.comando_editor() else {
+        app.diag(
+            "editor não configurado: defina [ui].editor no config, ou $VISUAL/$EDITOR no shell"
+                .into(),
+        );
+        return;
+    };
+    let original = app.input.clone();
+    let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crossterm::execute!(io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    let resultado = editar_texto(&original, &argv);
+    let _ = crossterm::execute!(io::stdout(), crossterm::terminal::EnterAlternateScreen);
+    if crossterm::terminal::enable_raw_mode().is_ok() {
+        // quadro inteiro é refeito no próximo draw; limpar evita restos do
+        // editor misturados ao painel
+        let _ = terminal.clear();
+    }
+    match resultado {
+        Ok(novo) => app.definir_input_do_editor(novo),
+        Err(e) => {
+            app.input = original;
+            app.info(format!("editor: {e}"));
         }
     }
 }
@@ -398,50 +488,16 @@ fn draw_input(app: &App, f: &mut Frame, area: Rect) {
     }
 }
 
-/// Nome de tecla legível para o código evdev configurado (levantado do
-/// /usr/include/linux/input-event-codes.h). Nada sai de caminho de dispositivo
-/// nem número cru na tela: "[voz] alt-right" diz tudo que interessa.
-fn nome_da_tecla_evdev(code: u16) -> String {
-    let nome = match code {
-        1 => "esc",
-        14 => "backspace",
-        15 => "tab",
-        28 => "enter",
-        29 => "ctrl-left",
-        42 => "shift-left",
-        54 => "shift-right",
-        56 => "alt-left",
-        57 => "espaco",
-        58 => "caps-lock",
-        69 => "num-lock",
-        70 => "scroll-lock",
-        87 => "f11",
-        88 => "f12",
-        97 => "ctrl-right",
-        100 => "alt-right",
-        102 => "home",
-        104 => "pgup",
-        105 => "seta-esq",
-        106 => "seta-dir",
-        107 => "end",
-        108 => "seta-baixo",
-        109 => "pgdn",
-        110 => "insert",
-        111 => "delete",
-        119 => "pause",
-        125 => "super-left",
-        126 => "super-right",
-        59..=68 => return format!("f{}", code - 58), // F1..F10 são sequenciais
-        outro => return format!("tecla {outro}"),
-    };
-    nome.to_string()
-}
+/// Ícones da barra de status (Nerd Font): ESTÁTICOS aqui de propósito — é
+/// só trocar o codepoint nestas constantes para trocar o glifo na barra.
+const ICONE_MIC: &str = "\u{f130}";
+const ICONE_VOL: &str = "󰕾";
 
 fn draw_status(app: &App, f: &mut Frame, area: Rect) {
     let (status_text, status_color) = match &app.status {
-        Status::Idle => ("Pronto", Color::Gray),
-        Status::Listening => ("Ouvindo…", Color::Red),
-        Status::Transcribing => ("Transcrevendo…", Color::LightYellow),
+        Status::Idle => ("Pronto", Color::Green),
+        Status::Listening => ("Ouvindo…", Color::Blue),
+        Status::Transcribing => ("Transcrevendo…", Color::Yellow),
         Status::Waiting => ("Aguardando o agente…", Color::LightCyan),
         Status::Speaking => ("Falando…", Color::LightMagenta),
         Status::Disconnected => ("Desconectado — reconectando…", Color::Red),
@@ -463,23 +519,26 @@ fn draw_status(app: &App, f: &mut Frame, area: Rect) {
         ))),
         areas[0],
     );
-    // DIREITA: o mínimo que não é óbvio — voz, cancelamento e rolagem.
-    // Fora: Enter envia (óbvio), Ctrl+C (óbvio num terminal), dispositivo
-    // e código cru da tecla de voz (ruído).
-    let voz = if app.cfg.push_to_talk.mode == "hold" {
-        app.cfg
-            .push_to_talk
-            .code
-            .map(|c| format!("[voz] {} · ", nome_da_tecla_evdev(c)))
-            .unwrap_or_default()
+    // DIREITA: placeholder de help (estático; sem recurso implementado por
+    // decisão do usuário) + o microfone. O glifo denuncia o modo de envio
+    // (cortado = auto-send OFF) e a cor denuncia a escuta: cinza parado,
+    // vermelho OUINDO — mesma cor do chip, impossível não notar.
+    let (icone, cor) = if app.auto_send {
+        (ICONE_MIC, Color::DarkGray)
     } else {
-        format!("[voz] alterna {} · ", app.cfg.push_to_talk.fallback_key)
+        (ICONE_VOL, Color::DarkGray)
+    };
+    let cor = if app.status == Status::Listening {
+        Color::Blue
+    } else {
+        cor
     };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("{voz}Esc cancela · Ctrl+U/Ctrl+D rola "),
-            Style::default().fg(Color::DarkGray),
-        )))
+        Paragraph::new(Line::from(vec![
+            Span::styled("[H] help  ·  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(icone, Style::default().fg(cor)),
+            Span::raw("  "),
+        ]))
         .alignment(Alignment::Right),
         areas[1],
     );
@@ -553,15 +612,30 @@ mod tests {
     }
 
     #[test]
-    fn tecla_do_dispositivo_vira_nome_legivel() {
-        // 100 = KEY_RIGHTALT (KEY_LEFTALT é 56): o relato em campo
-        assert_eq!(nome_da_tecla_evdev(100), "alt-right");
-        assert_eq!(nome_da_tecla_evdev(57), "espaco");
-        // F1..F10 são sequenciais a partir de 59
-        assert_eq!(nome_da_tecla_evdev(59), "f1");
-        assert_eq!(nome_da_tecla_evdev(68), "f10");
-        // código desconhecido degrada para identificável, nunca some
-        assert_eq!(nome_da_tecla_evdev(999), "tecla 999");
+    fn ctrl_a_e_ctrl_g_sao_acoes_nao_texto() {
+        let com_ctrl = |c: char| {
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(c),
+                crossterm::event::KeyModifiers::CONTROL,
+            )
+        };
+        assert!(matches!(
+            key_parse::parse_key(&com_ctrl('a'), None),
+            Some(ParsedKey::ToggleAutoSend)
+        ));
+        assert!(matches!(
+            key_parse::parse_key(&com_ctrl('g'), None),
+            Some(ParsedKey::OpenEditor)
+        ));
+        // sem Ctrl, 'a' e 'g' continuam digitando normalmente
+        let solto_q = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('q'),
+            crossterm::event::KeyModifiers::empty(),
+        );
+        assert!(matches!(
+            key_parse::parse_key(&solto_q, None),
+            Some(ParsedKey::InsertChar('q'))
+        ));
     }
 
     #[test]
@@ -583,5 +657,29 @@ mod tests {
             key_parse::parse_key(&ev_solto, None),
             Some(ParsedKey::InsertChar('u'))
         ));
+    }
+
+    #[test]
+    fn editor_externo_edita_o_rascunho_de_verdade() {
+        // argv puro com um editor de verdade da máquina: tudo por stdout/env
+        // da config, sem shell e sem comando fixo no produto (o 'sed' é do
+        // TESTE, não do cliente).
+        let argv: Vec<String> = vec!["sed".into(), "-i".into(), "s/rascunho/EDITADO/".into()];
+        let saida = editar_texto("linha com rascunho aqui", &argv).expect("editor deveria rodar");
+        assert!(saida.contains("EDITADO"), "conteúdo: {saida:?}");
+        assert!(!saida.contains("rascunho"), "conteúdo: {saida:?}");
+    }
+
+    #[test]
+    fn editor_que_falha_nao_silencia() {
+        let argv = vec!["false".to_string()];
+        let erro = editar_texto("qualquer", &argv).expect_err("false sai com erro");
+        assert!(erro.to_string().contains("saiu com"));
+    }
+
+    #[test]
+    fn comando_de_editor_vazio_rejeita() {
+        let erro = editar_texto("x", &[]).expect_err("argv vazio");
+        assert!(erro.to_string().contains("vazio"));
     }
 }

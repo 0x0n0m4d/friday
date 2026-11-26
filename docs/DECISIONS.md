@@ -243,12 +243,39 @@ O chat é um mostrador de mensagens: a chegada de mensagens nunca move a visuali
 - barra de status: SÓ o estado à esquerda; à direita só o não-óbvio — `[voz] <tecla legível>`,
   `Esc cancela`, `Ctrl+U/Ctrl+D rola`. Sem Enter envia/Ctrl+C (óbvio num terminal) e sem
   dispositivo/código cru da tecla (ruído);
-- a tecla do evdev sai com nome amigável (`nome_da_tecla_evdev`: código 100 → `alt-right`,
-  `f<n>`, etc.; código desconhecido degrada como `tecla <n>`, nunca some).
-
-Testado em testes unitários de `src/tui.rs` (fatiamento, nome de tecla, Ctrl sem virar texto) e em
+Testado em testes unitários de `src/tui.rs` (fatiamento, Ctrl sem virar texto) e em
 `tests/app_flow.rs` (`rolagem_meia_pagina_e_tela_estavel_como_log`,
 `mensagem_do_usuario_volta_ao_fundo_agente_nao`).
+
+## D16. Voz sob controle: auto-send (Ctrl+A) e editor externo (Ctrl+G)
+
+**Auto-send** (`[ui].auto_send`, estado inicial; `Ctrl+A` alterna em jogo): quando LIGADO, a
+transcrição do Whisper vira prompt direto (comportamento original, por voz). Quando DESLIGADO, a
+transcrição NÃO sai sozinha: entra na caixa de entrada para você conferir/editar e decidir o
+Enter. Sem fila de reenvio e sem prompt silencioso no caminho OFF — nada é despachado sem a sua
+ação. Como o áudio já circula por arquivo temporário (WAV) e o texto volta em memória, NÃO existe
+arquivo temporário intermediário do texto: colocar um seria um desvio sem função.
+
+**Editor externo** (`Ctrl+G`, no estilo Claude Code/Codex): o rascunho da caixa vai a um arquivo
+temporário (`0600`, prefixo `sexta-editor-`), o editor roda com o terminal do usuário (a TUI desce:
+raw mode e tela alternada passam para o editor) e o conteúdo volta para a caixa quando o editor
+fecha. Ordem de resolução do comando: `[ui].editor` no config, depois `$VISUAL`, depois `$EDITOR`
+— NADA fixo no código (sem editor embutido). Converte em argv puro (sem shell), caminho do arquivo
+como ÚLTIMO argumento. Editor que falha (não-zero, não executou) deixa o rascunho INTACTO e o
+motivo na tela. O texto volta em UMA linha: nova linha vira espaço, o `\n` final que todo editor
+insere é descartado, controles externos proibidos (`strip_escapes_and_control`).
+
+**Barra de status refeita** (revoga o desenho da D15): à esquerda só o estado (`| Pronto |`, com
+cor de fundo); à direita `[H] help` — PLACEHOLDER fixo no código, sem recurso implementado (por
+decisão do usuário por ora) — e o glifo do microfone. Os ícones são constantes nomeadas no topo
+de `src/tui.rs` (`ICONE_MIC` = `U+F130`, `ICONE_MIC_OFF` = `U+F131` c/u Nerd Fonts/FontAwesome)
+para trocar o glifo num só lugar. Cores: cinza parado, VERMELHO durante a escuta (mesma cor do
+"Ouvindo…"). Saíram da barra: caminho do dispositivo, código cru da tecla, dicas obvias.
+
+Testado em `src/tui.rs` (Ctrl+A/Ctrl+G não viram texto; editor real via argv; editor falha
+ruidosa) e `tests/app_flow.rs` (`auto_send_desligado_deixa_a_transcricao_na_caixa`,
+`auto_send_ligado_mantem_envio_automatico`, `editor_da_config_vira_argv_sem_shell`) e
+`src/config.rs` (padrão de `[ui]`, chaves aceitas).
 
 ## Itens VERIFY (incertos que dependem da instalação do usuário)
 

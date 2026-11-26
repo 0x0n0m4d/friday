@@ -30,6 +30,34 @@ pub struct Config {
     pub log: Log,
     #[serde(default)]
     pub paths: Paths,
+    #[serde(default)]
+    pub ui: Ui,
+}
+
+/// Ajustes de interface: editor externo e envio automático da voz.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct Ui {
+    /// Comando do editor para Ctrl+G: o rascunho vai para um arquivo
+    /// temporário e o caminho dele é anexado como ÚLTIMO argumento do
+    /// comando. Vazio/ausente: usa $VISUAL, depois $EDITOR.
+    #[serde(default)]
+    pub editor: Option<String>,
+    /// Estado inicial do envio automático da voz (Ctrl+A alterna em jogo).
+    /// true: transcrição vira prompt direto (comportamento original).
+    /// false: transcrição cai na caixa de entrada para você conferir/editar
+    /// antes do Enter — nada sai sem a sua ação.
+    #[serde(default = "default_true")]
+    pub auto_send: bool,
+}
+
+impl Default for Ui {
+    fn default() -> Self {
+        Ui {
+            editor: None,
+            auto_send: true,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -597,6 +625,24 @@ url = "ws://127.0.0.1:42617/acp"
     fn configuração_baseline_passa() {
         let cfg: Config = toml::from_str(BASE).unwrap();
         validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn ui_padrao_auto_send_ligado_sem_editor() {
+        let cfg: Config = toml::from_str(BASE).unwrap();
+        assert!(
+            cfg.ui.auto_send,
+            "auto-send desligado por padrão mudaria o comportamento de voz"
+        );
+        assert!(cfg.ui.editor.is_none(), "editor cai para $VISUAL/$EDITOR");
+    }
+
+    #[test]
+    fn ui_aceita_editor_e_auto_send_falso() {
+        let completo = format!("{BASE}\n[ui]\neditor = \"kak -l\"\nauto_send = false\n");
+        let cfg: Config = toml::from_str(&completo).unwrap();
+        assert_eq!(cfg.ui.editor.as_deref(), Some("kak -l"));
+        assert!(!cfg.ui.auto_send);
     }
 
     #[test]

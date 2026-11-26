@@ -663,3 +663,51 @@ fn mensagem_do_usuario_volta_ao_fundo_agente_nao() {
 
     app.teardown();
 }
+
+/// Auto-send desligado (Ctrl+A): a transcrição NÃO sai sozinha — cai na
+/// caixa de entrada para você conferir/editar e decidir o Enter.
+#[test]
+fn auto_send_desligado_deixa_a_transcricao_na_caixa() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _rx, _sim) = make_app(&[], tmp.path());
+    assert!(app.auto_send, "padrão vem de [ui].auto_send e é LIGADO");
+    app.on_key(ParsedKey::ToggleAutoSend);
+    assert!(!app.auto_send);
+
+    app.on_transcribed(Ok("leia o arquivo de trabalho\n".into()));
+    assert_eq!(
+        app.input, "leia o arquivo de trabalho",
+        "caixa recebeu a fala"
+    );
+    assert!(app.pending_prompt.is_none(), "nada foi enviado sozinho");
+    assert!(app.session_id.is_none() && app.status == Status::Idle);
+    app.teardown();
+}
+
+/// Auto-send ligado mantém o envio automático por voz: sem sessão, a fala
+/// vira mensagem pendente de reenvio (mesmo caminho do Enter), nunca input.
+#[test]
+fn auto_send_ligado_mantem_envio_automatico() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _rx, _sim) = make_app(&[], tmp.path());
+    app.on_transcribed(Ok("busca aí".into()));
+    assert!(
+        app.retry_text.is_some(),
+        "sem sessão: fica pendente de reenvio"
+    );
+    assert!(app.input.is_empty(), "não deve poluir a caixa");
+    app.teardown();
+}
+
+/// Editor de Ctrl+G vem da config e vira argv puro (sem shell, sem invite).
+#[test]
+fn editor_da_config_vira_argv_sem_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _rx, _sim) = make_app(&[], tmp.path());
+    app.cfg.ui.editor = Some("kak -l".into());
+    assert_eq!(
+        app.comando_editor(),
+        Some(vec!["kak".to_string(), "-l".to_string()])
+    );
+    app.teardown();
+}

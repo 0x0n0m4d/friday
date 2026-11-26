@@ -98,6 +98,11 @@ pub struct App {
     /// de meia página do Ctrl+U/Ctrl+D depende dela; antes do primeiro
     /// quadro vale 1, só para o salto existir.
     pub viewport_rows: std::cell::Cell<u16>,
+    /// Envio automático da voz (Ctrl+A alterna em jogo): verdadeiro = a
+    /// transcrição vira prompt direto como sempre foi; falso = a transcrição
+    /// cai na caixa de entrada para você conferir/editar antes do Enter.
+    /// Estado inicial vem de `[ui].auto_send` na configuração.
+    pub auto_send: bool,
 
     pub acp: Option<AcpClient>,
     pub session_id: Option<String>,
@@ -158,6 +163,7 @@ impl App {
         log: Arc<Logger>,
         events_tx: mpsc::Sender<AppEvent>,
     ) -> App {
+        let auto_send = cfg.ui.auto_send;
         App {
             cfg,
             agent_alias,
@@ -171,6 +177,7 @@ impl App {
             scroll_offset: 0,
             follow_tail: true,
             viewport_rows: std::cell::Cell::new(0),
+            auto_send,
             acp: None,
             session_id: None,
             init_phase: None,
@@ -502,6 +509,47 @@ impl App {
         }
     }
 
+    /// Ordem de resolução do editor externo (Ctrl+G): primeiro `[ui].editor`,
+    /// depois `$VISUAL`, depois `$EDITOR`. Tudo por configuração/ambiente —
+    /// nada de editor fixo no código. Converte em argv puro (sem shell).
+    pub fn comando_editor(&self) -> Option<Vec<String>> {
+        let bruto = self
+            .cfg
+            .ui
+            .editor
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::env::var("VISUAL")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .or_else(|| {
+                std::env::var("EDITOR")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })?;
+        let argv: Vec<String> = bruto.split_whitespace().map(str::to_string).collect();
+        (!argv.is_empty()).then_some(argv)
+    }
+
+    /// Conteúdo que volta do editor externo (Ctrl+G) para a caixa de input.
+    pub fn definir_input_do_editor(&mut self, texto: String) {
+        self.input = Self::linha_unica(&texto);
+    }
+
+    /// Texto que volta do editor externo ou da transcrição: a caixa é de uma
+    /// linha, então nova linha vira espaço (com controles externos proibidos).
+    pub fn linha_unica(texto: &str) -> String {
+        let limpos = sanitize::strip_escapes_and_control(texto)
+            .split('\n')
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        limpos
+    }
+
     fn restore_draft(&mut self) {
         if let Some(draft) = self.input_frozen_draft.take() {
             self.input = draft;
@@ -700,6 +748,14 @@ impl App {
                 self.status = Status::Idle;
             }
             Ok(text) => {
+                if !self.auto_send {
+                    // auto-send desligado (Ctrl+A): a fala NÃO sai sozinha —
+                    // entra na caixa para você conferir/editar (e decidir o
+                    // momento). Se o agente estiver ocupado, melhor ainda.
+                    self.input.push_str(&Self::linha_unica(&text));
+                    self.status = Status::Idle;
+                    return;
+                }
                 if self.pending_prompt.is_some() {
                     if self.queued_voice.is_none() {
                         self.queued_voice = Some(text);
@@ -1209,6 +1265,19 @@ impl App {
                 let text = std::mem::take(&mut self.input);
                 self.send_prompt(&text, false);
             }
+            ToggleAutoSend => {
+                // Ctrl+A: a voz nasce para enviar; aqui você decide por rodada.
+                // O estado fica visível na própria barra (glifo do microfone).
+                self.auto_send = !self.auto_send;
+                self.diag(if self.auto_send {
+                    "[voz] envio automático LIGADO: transcrição vira prompt".into()
+                } else {
+                    "[voz] envio automático DESLIGADO: transcrição vai para a caixa".into()
+                });
+            }
+            // Ctrl+G é tratado no laço da TUI (tui.rs): o editor roda com o
+            // terminal do usuário, fora do painel — o App só guarda o rascunho.
+            OpenEditor => {}
             ScrollUp => {
                 // Ctrl+U: sobe meia página. A tela fica ONDE O USUÁRIO COLOU:
                 // mensagens que chegam não arrastam a visualização de volta

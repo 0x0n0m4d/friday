@@ -126,6 +126,18 @@ enabled = true              # false desliga a voz (só texto)
 # vira o caminho do WAV temporário.
 command = ["/usr/bin/paplay", "{file}"]
 
+# ---- interface (editor externo e envio automático da voz) ----------
+[ui]
+# Comando do editor que o Ctrl+G abre: o rascunho vai para um arquivo
+# temporário e o caminho dele entra como ÚLTIMO argumento do comando.
+# Se comentado/ausente, o cliente usa $VISUAL, depois $EDITOR; sem nenhum
+# dos três, o Ctrl+G avisa na tela e preserva o rascunho.
+# editor = "kak -l"          # pode ter flags: é dividido em argv, sem shell
+# Estado inicial do envio automático da voz (Ctrl+A alterna em jogo):
+# true  = transcrição vira prompt direto (comportamento original);
+# false = transcrição cai na caixa de entrada para conferir/editar.
+# auto_send = true
+
 # ---- conexão com o daemon ZeroClaw --------------------------------
 [acp]
 # Único transporte suportado: WebSocket direto no endpoint /acp do gateway.
@@ -292,10 +304,18 @@ Teclas da TUI:
 - Digitar e **Enter** envia; **Esc** cancela o turno (configurável) responde "cancelled" no modal de
   permissão; **Ctrl+C** sai; **Ctrl+U/Ctrl+D** rolam a conversa meio a meio. A tela é um LOG:
   mensagens que chegam não arrastam a visualização; `Ctrl+D` até o fundo (ou mensagem sua) volta a
-  acompanhar. Na barra de status: estado à esquerda; à direita só o não-óbvio — `[voz]`,
-  `Esc cancela`, `Ctrl+U/Ctrl+D rola`.
+  acompanhar.
+- **Ctrl+A** alterna o envio automático por voz (`[ui].auto_send` define o estado inicial):
+  LIGADO = transcrição vira prompt direto; DESLIGADO = transcrição cai na caixa de entrada para
+  você conferir/editar antes do Enter. A barra mostra o estado no glifo do microfone.
+- **Ctrl+G** abre o rascunho no editor externo (`[ui].editor`, ou `$VISUAL`/`$EDITOR`): o texto
+  vai a um arquivo temporário, você edita à vontade e, ao fechar o editor, o conteúdo volta pra
+  caixa de entrada (mesma mecânica do `git commit`).
+- Barra de status: estado à esquerda (`| Pronto |`); à direita, `[H] help` (placeholder, fixo) e
+  o microfone — cinza parado, VERMELHO durante a escuta, glifo cortado quando o auto-send está off.
 - **Segure a tecla de voz** (modo hold): a digitação congela, a fala em curso é interrompida na hora,
-  grava enquanto pressionada; ao soltar, transcreve e **envia automaticamente** — sem confirmação.
+  grava enquanto pressionada; ao soltar, transcreve e **envia automaticamente** — sem confirmação
+  (com o auto-send DESLIGADO, `Ctrl+A`, a transcrição cai na caixa de entrada em vez de enviar).
   A resposta do agente chega em streaming e é falada em frases, com Markdown removido.
 - Modal de permissão (`session/request_permission`): abre no centro, sobe/desce com setas,
   **Enter** confirma a opção, **Esc** responde "cancelled". Aprovação **nunca** acontece por voz.
