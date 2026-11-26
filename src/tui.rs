@@ -4,7 +4,7 @@
 use std::io;
 use std::io::Write;
 use std::process::Command;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use crossterm::event::Event as CEvent;
@@ -36,6 +36,13 @@ pub mod key_parse {
         ToggleAutoSend,
         OpenEditor,
         Backspace,
+        Delete,
+        CursorLeft,
+        CursorRight,
+        Home,
+        End,
+        KillWord,
+        KillToEnd,
         InsertChar(char),
         Paste(String),
         ToggleKey,
@@ -60,6 +67,21 @@ pub mod key_parse {
             KeyCode::Esc => Some(ParsedKey::Cancel),
             KeyCode::Enter => Some(ParsedKey::Submit),
             KeyCode::Backspace => Some(ParsedKey::Backspace),
+            // Edição padrão da caixa: setas andam o cursor, Home/End saltam,
+            // Delete apaga À FRENTE (Backspace apaga atrás).
+            KeyCode::Left => Some(ParsedKey::CursorLeft),
+            KeyCode::Right => Some(ParsedKey::CursorRight),
+            KeyCode::Home => Some(ParsedKey::Home),
+            KeyCode::End => Some(ParsedKey::End),
+            KeyCode::Delete => Some(ParsedKey::Delete),
+            // Edição readline: Ctrl+W apaga a palavra à esquerda, Ctrl+K
+            // mata até o fim da linha (Ctrl+A aqui é auto-send, não Home).
+            KeyCode::Char('w') if ev.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(ParsedKey::KillWord)
+            }
+            KeyCode::Char('k') if ev.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(ParsedKey::KillToEnd)
+            }
             KeyCode::Up => Some(ParsedKey::ModalUp),
             KeyCode::Down => Some(ParsedKey::ModalDown),
             // Rolagem por Ctrl+U/Ctrl+D (semântica less/vim: meia página por
@@ -132,36 +154,67 @@ pub fn run(mut app: App, events_rx: Receiver<AppEvent>) {
     } else {
         None
     };
-    let parsed_toggle = toggle_key.clone();
-    let key_tx = app.events_tx.clone();
-    let keyboard = std::thread::Builder::new()
-        .name("keyboard".into())
-        .spawn(move || keyboard_thread(key_tx, parsed_toggle.as_deref()));
-    if let Err(e) = keyboard {
-        app.info(format!(
-            "teclado do terminal não iniciou: {e} — digitação indisponível"
-        ));
-    }
 
     app.start();
     let key_rx = events_rx;
+
+    // O teclado do terminal é lido NESTE fio, com poll de 0ms. É isto que
+    // dá o controle total ao editor externo (Ctrl+G): quando ele abre, o
+    // MESMO fio que lia o teclado fica dentro do editor até ele fechar —
+    // não existe nenhum outro leitor disputando a entrada, então as teclas
+    // do editor (neovim, kakoune, o que for) NUNCA vazam para a caixa de
+    // entrada do cliente. (Antes havia um fio separado em `event::read()`
+    // eterno: enquanto o editor rodava, ele continuava sugando o teclado.)
+    let mut teclado_vivo = true;
 
     while !app.quit {
         // Drena as respostas do agente antes de esperar eventos: sem isto o
         // fio leitor enche o canal e o handshake apodrece (initialize nunca
         // é processado). Ver docs/DECISIONS.md.
         app.pump_acp(Duration::from_millis(0));
-        match key_rx.recv_timeout(Duration::from_millis(25)) {
-            Ok(ev) => {
-                // Ctrl+G é outro de fluxo: o editor roda com o terminal do
-                // USUÁRIO (tela cheia), nunca dentro do painel — a TUI
-                // desce, o editor abre, e tudo volta quando ele sai.
-                if matches!(ev, AppEvent::Key(ParsedKey::OpenEditor)) {
-                    abrir_editor(&mut app, &mut terminal);
-                } else {
-                    handle_event(&mut app, ev);
+        if teclado_vivo {
+            while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
+                match crossterm::event::read() {
+                    Ok(CEvent::Key(ev)) => {
+                        if let Some(pk) = key_parse::parse_key(&ev, toggle_key.as_deref()) {
+                            // Ctrl+G é outro fluxo: o editor roda com o terminal
+                            // do USUÁRIO (tela cheia), nunca dentro do painel —
+                            // a TUI desce, o editor abre, e tudo volta quando
+                            // ele sai. Aqui ninguém mais lê o teclado até lá.
+                            if matches!(pk, ParsedKey::OpenEditor) {
+                                abrir_editor(&mut app, &mut terminal);
+                            } else {
+                                handle_event(&mut app, AppEvent::Key(pk));
+                            }
+                            if app.quit {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(CEvent::Paste(text)) => {
+                        handle_event(&mut app, AppEvent::Key(ParsedKey::Paste(text)));
+                    }
+                    Ok(CEvent::Resize(_, _)) => {
+                        // nada: o draw do fim do laço já redesenha tudo
+                    }
+                    Err(_) => {
+                        // Fonte de eventos morta: reporta UMA vez e para de
+                        // ler (o laço abaixo continuaria drenando erro).
+                        teclado_vivo = false;
+                        app.on_key_source_failed(
+                            "leitura do teclado do terminal falhou; digitação indisponível".into(),
+                        );
+                        break;
+                    }
+                    _ => {}
                 }
             }
+        }
+        if app.quit {
+            break;
+        }
+        match key_rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(ev) => handle_event(&mut app, ev),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 app.events_tx.send(AppEvent::Tick).ok();
                 handle_event(&mut app, AppEvent::Tick);
@@ -225,30 +278,6 @@ fn handle_event(app: &mut App, ev: AppEvent) {
 fn toggle_now(app: &App) -> bool {
     // "não ativo" → "ativo" quando não há gravação em andamento
     app.recording.is_none()
-}
-
-fn keyboard_thread(tx: Sender<AppEvent>, toggle_key: Option<&str>) {
-    loop {
-        match crossterm::event::read() {
-            Ok(CEvent::Key(ev)) => {
-                if let Some(pk) = key_parse::parse_key(&ev, toggle_key) {
-                    if tx.send(AppEvent::Key(pk)).is_err() {
-                        return;
-                    }
-                }
-            }
-            Ok(CEvent::Paste(text)) => {
-                if tx.send(AppEvent::Key(ParsedKey::Paste(text))).is_err() {
-                    return;
-                }
-            }
-            Ok(CEvent::Resize(_, _)) => {
-                let _ = tx.send(AppEvent::Tick);
-            }
-            Err(_) => return,
-            _ => {}
-        }
-    }
 }
 
 /// Mecânica do Ctrl+G, sem terminal (testável): escreve o rascunho num
@@ -481,8 +510,16 @@ fn draw_input(app: &App, f: &mut Frame, area: Rect) {
         .wrap(Wrap { trim: false });
     f.render_widget(input, area);
     if !frozen {
-        let width = unicode_width::UnicodeWidthStr::width(app.input.as_str()) as u16;
-        let x = area.x + 1 + width;
+        // O cursor fica onde o usuário DEIXOU (input_cursor em chars), não
+        // colado no fim: a largura exibida é a soma das colunas dos chars
+        // ANTES do cursor (emoji/acentuados ocupam mais de 1 coluna).
+        let colunas_antes: usize = app
+            .input
+            .chars()
+            .take(app.input_cursor)
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum();
+        let x = area.x + 1 + colunas_antes as u16;
         let y = area.y + 1;
         f.set_cursor_position((x.min(area.x + area.width.saturating_sub(2)), y));
     }
@@ -490,8 +527,8 @@ fn draw_input(app: &App, f: &mut Frame, area: Rect) {
 
 /// Ícones da barra de status (Nerd Font): ESTÁTICOS aqui de propósito — é
 /// só trocar o codepoint nestas constantes para trocar o glifo na barra.
-const ICONE_MIC: &str = "\u{f130}";
-const ICONE_VOL: &str = "󰕾";
+const ICONE_MIC: &str = "";
+const ICONE_VOL: &str = "󰤌";
 
 fn draw_status(app: &App, f: &mut Frame, area: Rect) {
     let (status_text, status_color) = match &app.status {

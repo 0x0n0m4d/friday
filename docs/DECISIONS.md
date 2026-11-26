@@ -277,6 +277,40 @@ ruidosa) e `tests/app_flow.rs` (`auto_send_desligado_deixa_a_transcricao_na_caix
 `auto_send_ligado_mantem_envio_automatico`, `editor_da_config_vira_argv_sem_shell`) e
 `src/config.rs` (padrão de `[ui]`, chaves aceitas).
 
+## D17. Transcrição limpa, editor no controle total e caixa de entrada com cursor
+
+Três correções de comportamento real observado na máquina do usuário.
+
+**Carimbos de tempo fora do prompt** (`src/stt.rs`): o Whisper instalado imprime
+`[00:00:00.000 --> 00:00:17.000]` junto do texto mesmo com `--no-prints` — e essa duração de
+gravação ia PARAR DENTRO DO PROMPT do modelo. A limpeza única da transcrição
+(`strip_silence_markers`) agora também descarta carimbos: par de colchetes cujo conteúdo é puro
+relógio (dígitos, `:`, `.`, `-->`, espaço) e contém `-->` sai fora; colchete de texto de verdade
+(`[nota]`) é preservado. Só o que foi DITO chega ao modelo — local e servidor passam pelo mesmo
+filtro. Testado em `src/stt.rs` (`carimbo_de_tempo_do_whisper_nao_vira_texto`,
+`carimbos_no_meio_da_frase_sao_removidos`, `colchete_de_texto_de_verdade_e_preservado`,
+`so_carimbo_e_silencio_vira_none`).
+
+**O editor assume o terminal INTEIRO** (`src/tui.rs`): antes, a leitura do teclado vivia num fio
+separado em `event::read()` eterno — enquanto o editor externo rodava, esse fio continuava
+sugando a entrada: tecla do neovim virava texto na caixa do cliente. Agora o teclado é lido NO
+fio principal (`event::poll(0ms)` + drain). Quando o Ctrl+G abre o editor, o MESMO fio entra
+nele e não existe NENHUM outro leitor disputando o teclado: o editor tem controle total do
+terminal até fechar, e nada vaza para a caixa. O cliente só volta a ler o teclado depois que o
+editor sai — e então lê o ARQUIVO, não o teclado do editor.
+
+**Caixa de entrada com cursor de verdade** (`src/app.rs`, `src/tui.rs`): a caixa ganhou
+`input_cursor` (índice em CHARS, UTF-8 seguro — emoji/acentuados nunca são corrompidos). Setas
+esquerda/direita andam o cursor; `Home`/`End` vão às pontas; `Delete` apaga À FRENTE;
+`Backspace` apaga ATRÁS (antes era só o último char do texto todo); `Ctrl+W` apaga a palavra à
+esquerda (readline); `Ctrl+K` mata até o fim (readline). Digitação e colagem inserem ONDE o
+cursor está, não mais no fim. O cursor é DESENHADO na posição correta por colunas
+(`unicode-width`). Texto que chega de fora (voz sem auto-send, retorno do editor, rascunho
+restaurado) posiciona o cursor no fim; `Submit` zera. `Ctrl+A` aqui é auto-send (D16), NÃO
+Home-de-readline. Testado em `src/app.rs` (`input_tem_cursor_setas_e_home_end_editam_no_meio`,
+`ctrl_w_apaga_palavra_e_ctrl_k_mata_ate_o_fim`, `submit_limpa_a_caixa_e_zera_o_cursor`,
+`cursor_sobrevive_a_utf8_multibyte`).
+
 ## Itens VERIFY (incertos que dependem da instalação do usuário)
 
 | Item | Onde | Por quê |

@@ -126,9 +126,42 @@ fn kill_group(pgid: i32) {
     }
 }
 
-/// Remove marcadores de silêncio e espaços; vazio vira `None`.
+/// Descarta carimbos de tempo do Whisper — `[00:00:01.250 --> 00:00:17.480]`,
+/// com ou sem milissegundos — que alguns builds imprimem mesmo com
+/// `--no-prints`. Ao modelo só pode chegar o que foi DITO: a duração da
+/// gravação é ruído verboso que ia parar dentro do prompt. É carimbo quando
+/// o conteúdo do par de colchetes é puro relógio (dígitos, `:`, `.`, `-->`,
+/// espaço) e contém `-->`; colchete de texto de verdade é preservado.
+fn remove_carimbos_de_tempo(texto: &str) -> String {
+    let chars: Vec<char> = texto.chars().collect();
+    let mut saida = String::with_capacity(texto.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '[' {
+            if let Some(fim_rel) = chars[i..].iter().take(64).position(|&c| c == ']') {
+                let interno: String = chars[i + 1..i + fim_rel].iter().collect();
+                let e_carimbo = !interno.is_empty()
+                    && interno.contains("-->")
+                    && interno
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || matches!(c, ':' | '.' | '-' | '>' | ' '));
+                if e_carimbo {
+                    i += fim_rel + 1;
+                    continue;
+                }
+            }
+        }
+        saida.push(chars[i]);
+        i += 1;
+    }
+    saida
+}
+
+/// Remove carimbos de tempo, marcadores de silêncio e espaços; vazio vira
+/// `None`. Ponto ÚNICO de limpeza da transcrição (local e servidor): tudo
+/// que chega ao modelo passa por aqui.
 pub fn strip_silence_markers(text: &str, markers: &[String]) -> Option<String> {
-    let mut t = text.trim().to_string();
+    let mut t = remove_carimbos_de_tempo(text.trim());
     for m in markers {
         while t.contains(m.as_str()) {
             t = t.replace(m.as_str(), " ");
@@ -245,6 +278,45 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, make_wav16k()).unwrap();
         p
+    }
+
+    #[test]
+    fn carimbo_de_tempo_do_whisper_nao_vira_texto() {
+        // O bug real: o modelo recebia a DURAÇÃO da gravação junto com a fala.
+        assert_eq!(
+            strip_silence_markers(
+                "[00:00:00.000 --> 00:00:17.000] leia o arquivo de trabalho",
+                &[]
+            ),
+            Some("leia o arquivo de trabalho".into())
+        );
+    }
+
+    #[test]
+    fn carimbos_no_meio_da_frase_sao_removidos() {
+        assert_eq!(
+            strip_silence_markers(
+                "início [00:00:01 --> 00:00:02] do meio [00:00:03.500 --> 00:00:04.250] fim",
+                &[]
+            ),
+            Some("início do meio fim".into())
+        );
+    }
+
+    #[test]
+    fn colchete_de_texto_de_verdade_e_preservado() {
+        assert_eq!(
+            strip_silence_markers("veja a seção [nota] do documento", &[]),
+            Some("veja a seção [nota] do documento".into())
+        );
+    }
+
+    #[test]
+    fn so_carimbo_e_silencio_vira_none() {
+        assert_eq!(
+            strip_silence_markers("[00:00:00.000 --> 00:00:09.000]", &[]),
+            None
+        );
     }
 
     #[test]

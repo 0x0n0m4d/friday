@@ -305,17 +305,24 @@ Teclas da TUI:
   permissão; **Ctrl+C** sai; **Ctrl+U/Ctrl+D** rolam a conversa meio a meio. A tela é um LOG:
   mensagens que chegam não arrastam a visualização; `Ctrl+D` até o fundo (ou mensagem sua) volta a
   acompanhar.
+- A caixa de entrada tem cursor de verdade: **setas** movem, **Home/End** vão às pontas,
+  **Delete** apaga à frente, **Backspace** apaga atrás, **Ctrl+W** apaga a palavra à esquerda,
+  **Ctrl+K** mata até o fim — tudo inserido/apagado ONDE o cursor está, com UTF-8 seguro.
 - **Ctrl+A** alterna o envio automático por voz (`[ui].auto_send` define o estado inicial):
   LIGADO = transcrição vira prompt direto; DESLIGADO = transcrição cai na caixa de entrada para
   você conferir/editar antes do Enter. A barra mostra o estado no glifo do microfone.
 - **Ctrl+G** abre o rascunho no editor externo (`[ui].editor`, ou `$VISUAL`/`$EDITOR`): o texto
   vai a um arquivo temporário, você edita à vontade e, ao fechar o editor, o conteúdo volta pra
-  caixa de entrada (mesma mecânica do `git commit`).
+  caixa de entrada (mesma mecânica do `git commit`). Enquanto o editor está aberto ele tem o
+  CONTROLE TOTAL do terminal — nenhuma tecla sua dentro do editor vaza para a caixa; o cliente
+  lê de volta o arquivo salvo, não o teclado.
 - Barra de status: estado à esquerda (`| Pronto |`); à direita, `[H] help` (placeholder, fixo) e
   o microfone — cinza parado, VERMELHO durante a escuta, glifo cortado quando o auto-send está off.
 - **Segure a tecla de voz** (modo hold): a digitação congela, a fala em curso é interrompida na hora,
   grava enquanto pressionada; ao soltar, transcreve e **envia automaticamente** — sem confirmação
   (com o auto-send DESLIGADO, `Ctrl+A`, a transcrição cai na caixa de entrada em vez de enviar).
+  A transcrição chega LIMPA ao modelo: carimbos de tempo do Whisper
+  (`[00:00:00.000 --> 00:00:17.000]`) são descartados — só o que você falou é enviado.
   A resposta do agente chega em streaming e é falada em frases, com Markdown removido.
 - Modal de permissão (`session/request_permission`): abre no centro, sobe/desce com setas,
   **Enter** confirma a opção, **Esc** responde "cancelled". Aprovação **nunca** acontece por voz.

@@ -84,6 +84,9 @@ pub struct App {
 
     pub chat: Vec<ChatItem>,
     pub input: String,
+    /// Posição do cursor na caixa de entrada, em CHARS (não bytes) a partir
+    /// do início: setas/Home/End andam por caractere, UTF-8 seguro.
+    pub input_cursor: usize,
     pub input_frozen_draft: Option<String>,
     pub status: Status,
     /// Distância (em linhas visuais) entre o fundo da tela e a última linha
@@ -172,6 +175,7 @@ impl App {
             events_tx,
             chat: Vec::new(),
             input: String::new(),
+            input_cursor: 0,
             input_frozen_draft: None,
             status: Status::Idle,
             scroll_offset: 0,
@@ -533,9 +537,39 @@ impl App {
         (!argv.is_empty()).then_some(argv)
     }
 
+    /// Byte offset do cursor no `input` (a partir do índice de chars).
+    fn byte_do_cursor(&self) -> usize {
+        self.input
+            .char_indices()
+            .nth(self.input_cursor)
+            .map_or(self.input.len(), |(b, _)| b)
+    }
+
+    /// Insere um char ONDE o cursor está (e o avança): editar no meio do
+    /// texto tem que funcionar, não só colar no fim.
+    fn inserir_no_cursor(&mut self, c: char) {
+        let byte = self.byte_do_cursor();
+        self.input.insert(byte, c);
+        self.input_cursor += 1;
+    }
+
+    /// Anda o cursor `delta` chars (negativo = esquerda), preso em [0, len].
+    fn mover_cursor(&mut self, delta: isize) {
+        let len = self.input.chars().count() as isize;
+        let alvo = self.input_cursor as isize + delta;
+        self.input_cursor = alvo.clamp(0, len) as usize;
+    }
+
+    /// Cursor para o fim — usado quando texto chega de fora (editor, voz,
+    /// colagem): a próxima tecla edita DEPOIS do que acabou de entrar.
+    fn cursor_para_fim(&mut self) {
+        self.input_cursor = self.input.chars().count();
+    }
+
     /// Conteúdo que volta do editor externo (Ctrl+G) para a caixa de input.
     pub fn definir_input_do_editor(&mut self, texto: String) {
         self.input = Self::linha_unica(&texto);
+        self.cursor_para_fim();
     }
 
     /// Texto que volta do editor externo ou da transcrição: a caixa é de uma
@@ -553,6 +587,7 @@ impl App {
     fn restore_draft(&mut self) {
         if let Some(draft) = self.input_frozen_draft.take() {
             self.input = draft;
+            self.cursor_para_fim();
         }
     }
 
@@ -630,6 +665,7 @@ impl App {
             self.status = Status::Idle;
         }
         self.input_frozen_draft = Some(std::mem::take(&mut self.input));
+        self.input_cursor = 0;
         if self.recording.is_some() {
             return;
         }
@@ -753,6 +789,7 @@ impl App {
                     // entra na caixa para você conferir/editar (e decidir o
                     // momento). Se o agente estiver ocupado, melhor ainda.
                     self.input.push_str(&Self::linha_unica(&text));
+                    self.cursor_para_fim();
                     self.status = Status::Idle;
                     return;
                 }
@@ -1263,6 +1300,7 @@ impl App {
                     return;
                 }
                 let text = std::mem::take(&mut self.input);
+                self.input_cursor = 0;
                 self.send_prompt(&text, false);
             }
             ToggleAutoSend => {
@@ -1296,16 +1334,60 @@ impl App {
                 }
             }
             Backspace => {
-                self.input.pop();
+                // Apaga o char ANTES do cursor (não mais o último do texto
+                // todo): é o que faz um terminal de verdade.
+                if self.input_cursor > 0 {
+                    let byte = self.byte_do_cursor();
+                    let ini = self.input[..byte]
+                        .char_indices()
+                        .next_back()
+                        .map(|(b, _)| b)
+                        .unwrap_or(0);
+                    self.input.replace_range(ini..byte, "");
+                    self.input_cursor -= 1;
+                }
+            }
+            Delete => {
+                // Apaga o char NA frente do cursor.
+                let byte = self.byte_do_cursor();
+                if let Some(c) = self.input[byte..].chars().next() {
+                    self.input.replace_range(byte..byte + c.len_utf8(), "");
+                }
+            }
+            CursorLeft => self.mover_cursor(-1),
+            CursorRight => self.mover_cursor(1),
+            Home => self.input_cursor = 0,
+            End => self.cursor_para_fim(),
+            KillWord => {
+                // Ctrl+W (readline): apaga a palavra à esquerda do cursor,
+                // com os espaços que a separam do resto.
+                let chars: Vec<char> = self.input.chars().collect();
+                let mut i = self.input_cursor;
+                while i > 0 && chars[i - 1].is_whitespace() {
+                    i -= 1;
+                }
+                let fim_palavra = i;
+                while i > 0 && !chars[i - 1].is_whitespace() {
+                    i -= 1;
+                }
+                let ini_byte: usize = chars[..i].iter().map(|c| c.len_utf8()).sum();
+                let fim_byte: usize = chars[..fim_palavra].iter().map(|c| c.len_utf8()).sum();
+                self.input.replace_range(ini_byte..fim_byte, "");
+                self.input_cursor = i;
+            }
+            KillToEnd => {
+                // Ctrl+K (readline): mata da posição do cursor até o fim.
+                let byte = self.byte_do_cursor();
+                self.input.truncate(byte);
             }
             InsertChar(c) => {
                 if !c.is_control() {
-                    self.input.push(c);
+                    self.inserir_no_cursor(c);
                 }
             }
             Paste(text) => {
                 for c in sanitize::strip_escapes_and_control(&text).chars() {
-                    self.input.push(c);
+                    self.inserir_no_cursor(c);
                 }
             }
             _ => {}
@@ -1451,5 +1533,108 @@ fn find_sentence_end(buffer: &str) -> Option<usize> {
 impl ChatItem {
     pub fn rendered(&self) -> String {
         sanitize::strip_escapes_and_control(&self.text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logger::Logger;
+    use crate::state::StateDir;
+
+    /// App mínimo (sem daemon, sem dispositivos): só a máquina de estados
+    /// para exercitar a edição da caixa de entrada.
+    fn app_de_teste() -> (App, tempfile::TempDir) {
+        let cfg: Config = toml::from_str("[acp]\nurl = \"ws://127.0.0.1:1/acp\"\n").unwrap();
+        let (tx, _rx) = mpsc::channel::<AppEvent>();
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::open(dir.path().to_path_buf()).unwrap();
+        let log = Arc::new(Logger::open(&state.journal_dir()));
+        let app = App::new(cfg, "casa".into(), Some(state), log, tx);
+        (app, dir)
+    }
+
+    fn digitar(app: &mut App, texto: &str) {
+        for c in texto.chars() {
+            app.on_key(ParsedKey::InsertChar(c));
+        }
+    }
+
+    #[test]
+    fn input_tem_cursor_setas_e_home_end_editam_no_meio() {
+        let (mut app, _dir) = app_de_teste();
+        digitar(&mut app, "abcdef");
+        assert_eq!(app.input_cursor, 6);
+        // anda três para a esquerda e insere no MEIO do texto
+        app.on_key(ParsedKey::CursorLeft);
+        app.on_key(ParsedKey::CursorLeft);
+        app.on_key(ParsedKey::CursorLeft);
+        app.on_key(ParsedKey::InsertChar('X'));
+        assert_eq!(app.input, "abcXdef");
+        assert_eq!(app.input_cursor, 4);
+        // Backspace apaga o X (que está ATRÁS do cursor)
+        app.on_key(ParsedKey::Backspace);
+        assert_eq!(app.input, "abcdef");
+        assert_eq!(app.input_cursor, 3);
+        // Delete apaga o char À FRENTE do cursor
+        app.on_key(ParsedKey::Delete);
+        assert_eq!(app.input, "abcef");
+        // Home insere no começo; End volta ao fim
+        app.on_key(ParsedKey::Home);
+        app.on_key(ParsedKey::InsertChar('>'));
+        assert_eq!(app.input, ">abcef");
+        app.on_key(ParsedKey::End);
+        app.on_key(ParsedKey::InsertChar('!'));
+        assert_eq!(app.input, ">abcef!");
+        // as setas não passam das pontas
+        app.on_key(ParsedKey::CursorLeft);
+        for _ in 0..50 {
+            app.on_key(ParsedKey::CursorLeft);
+        }
+        assert_eq!(app.input_cursor, 0);
+        for _ in 0..50 {
+            app.on_key(ParsedKey::CursorRight);
+        }
+        assert_eq!(app.input_cursor, app.input.chars().count());
+    }
+
+    #[test]
+    fn ctrl_w_apaga_palavra_e_ctrl_k_mata_ate_o_fim() {
+        let (mut app, _dir) = app_de_teste();
+        digitar(&mut app, "um dois tres");
+        app.on_key(ParsedKey::KillWord);
+        assert_eq!(app.input, "um dois ");
+        assert_eq!(app.input_cursor, 8);
+        app.on_key(ParsedKey::Home);
+        for _ in 0..3 {
+            app.on_key(ParsedKey::CursorRight);
+        }
+        app.on_key(ParsedKey::KillToEnd);
+        assert_eq!(app.input, "um ");
+        assert_eq!(app.input_cursor, 3);
+    }
+
+    #[test]
+    fn submit_limpa_a_caixa_e_zera_o_cursor() {
+        let (mut app, _dir) = app_de_teste();
+        digitar(&mut app, "olá, mundo");
+        app.on_key(ParsedKey::Submit);
+        assert!(app.input.is_empty());
+        assert_eq!(app.input_cursor, 0);
+        assert_eq!(app.retry_text.as_deref(), Some("olá, mundo"));
+    }
+
+    #[test]
+    fn cursor_sobrevive_a_utf8_multibyte() {
+        let (mut app, _dir) = app_de_teste();
+        digitar(&mut app, "☕x");
+        // cursor entre ☕ e x: backspace apaga o EMOJI inteiro (2 bytes),
+        // nunca um meio-caractere que corromperia a String.
+        app.on_key(ParsedKey::CursorLeft);
+        app.on_key(ParsedKey::Backspace);
+        assert_eq!(app.input, "x");
+        assert_eq!(app.input_cursor, 0);
+        app.on_key(ParsedKey::InsertChar('á'));
+        assert_eq!(app.input, "áx");
     }
 }
